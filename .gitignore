@@ -1,0 +1,14 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 분석 산출물·ipa 는 저장소에 넣지 않는다
+*.ipa
+.pytest_cache/

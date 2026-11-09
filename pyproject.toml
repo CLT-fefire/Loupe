@@ -1,0 +1,26 @@
+[project]
+name = "loupe"
+version = "0.1.0"
+description = "직접 빌드한 ipa 정적 분석 MCP — 보호 솔루션 적용 여부, 문자열·이름 노출, Ghidra 디컴파일"
+authors = [
+    { name = "ChulhwaJung", email = "fefire@dearu.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "lief>=1.0.0",
+    "mcp>=1.20",
+    "pyghidra>=3.1",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+loupe = "loupe.server:main"
+
+[build-system]
+requires = ["uv_build>=0.9.17,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]

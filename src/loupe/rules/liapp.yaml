@@ -1,0 +1,22 @@
+# LIAPP(iOS) 적용 판정 규칙.
+# 근거: 2026-11-09 Fork_Stars 1.5.0.1 QA_QARelease 빌드에서 적용본과 미적용본을 비교했다.
+#   - .app 에 아래 4개 파일이 추가된다(내용은 암호화돼 있다).
+#   - ObjC/Swift 이름 일부를 같은 길이로 바꾼다. 예: AppDelegate -> zZZZZZLaaaa, handlers -> paaaaaaa
+#   - 코드(__text)와 문자열 리터럴은 바꾸지 않는다.
+#   - LIAPP SDK 는 미적용본에도 링크돼 있으니, 바이너리 안의 "LIAPP" 문자열은 적용 근거가 아니다.
+name: LIAPP
+added_files:
+  - LIAPP.ini
+  - LIAPPEgg.DCR
+  - LIAPPEgg.RST
+  - LIAPPEgg.re
+obfuscated_name:
+  # 이름 조각 하나 전체가 이 패턴이면 난독화된 이름으로 본다.
+  regex: '(?:zZ*)?[A-Za-z]a{2,}'
+  min_len: 4
+  # __objc_classname 에서 이 비율 이상이면 난독화가 적용된 것으로 본다.
+  classname_ratio_threshold: 0.05
+sdk_markers:
+  # SDK 가 링크돼 있다는 참고 정보로만 쓴다(적용 여부와 무관).
+  class_names: [Liapp]
+  strings: [libLiapp, LIAPPAntiDebug]
