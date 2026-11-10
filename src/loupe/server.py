@@ -20,13 +20,17 @@ Loupe — 우리가 직접 빌드한 ipa 를 정적으로 분석한다(보호 �
 순서: ipa_open(경로) 로 id 를 받고, 그 id 로 다른 도구를 부른다. 같은 ipa 는 다시 풀지 않는다.
 - 적용 여부: protection_check(id). 근거(추가 파일, 난독화 이름 비율)를 같이 준다.
 - 쌍 비교: ipa_diff(a, b). 같은 빌드의 미적용(a)·적용(b) 쌍이어야 의미가 있다. 빌드 종류가 다르면 경고한다.
-- 문자열: find_strings(ids, query|regex|source_ref). 15바이트 이하 Swift 문자열은 명령어에 인라인돼
-  0건이어도 '없다'는 뜻이 아니다 — 그럴 땐 Ghidra(decompile)로 확인한다.
+- 문자열: find_strings(ids, query|regex|source_ref). 15바이트 이하는 Swift 가 명령어 즉값으로 넣으므로
+  '(Swift 인라인)' 줄에서 명령어 패턴으로 따로 찾는다. 찾은 address 는 decompile 로 확인한다.
 - 이름: list_names(id, other_id?) 로 난독화된/보존된 클래스·메서드 이름을 본다.
+- 키·토큰: secret_scan(id). 알려진 형식만 찾고 값은 가린다(reveal=true 로 원문).
+- 쌍 요약: pair_report(a, b). 판정·코드 변경·이름·남은 키·엔타이틀먼트를 한 번에, 공유용 markdown 포함.
 - Ghidra: ghidra_analyze 로 시작(26MB 바이너리는 약 10분, ghidra_status 가 예상 시간을 준다) → search_functions /
   decompile / xrefs. 같은 함수를 두 ipa 에서 비교하려면 compare_function(a, b, function).
 
-찾은 값은 원문으로 돌려준다. 외부(Confluence·메일 등)로 옮길 때 키·토큰 같은 값은 사람이 가린다.
+find_strings·list_names·decompile 등은 찾은 값을 원문으로 돌려준다. 외부(Confluence·메일 등)로 옮길 때
+키·토큰 같은 값은 사람이 가린다. secret_scan 과 pair_report 는 값을 가려서 준다 — 가린 값('AIza…qU (39자)')은
+검색어로 쓸 수 없고, 같은 값인지는 fingerprint 로 본다. 원문이 꼭 필요할 때만 secret_scan(reveal=true).
 App Store 에서 받은 ipa(FairPlay 암호화)는 분석할 수 없다.
 """
 
@@ -47,7 +51,8 @@ def _audit(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         t = time.time()
-        ids = {k: v for k, v in kwargs.items() if k in ("id", "a", "b", "ids", "other_id")}
+        # reveal 은 원문 열람 여부를 남기려고 기록한다(값은 남기지 않는다)
+        ids = {k: v for k, v in kwargs.items() if k in ("id", "a", "b", "ids", "other_id", "reveal")}
         try:
             out = fn(*args, **kwargs)
             _log.info("%s ok ids=%s bytes=%d %.1fs", fn.__name__, ids, len(json.dumps(out, default=str)), time.time() - t)
@@ -95,8 +100,8 @@ def ipa_open(path: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=READ)
 @_audit
-def ipa_list() -> list[dict]:
-    """지금까지 열어 둔(캐시에 있는) ipa 목록."""
+def ipa_list() -> dict[str, Any]:
+    """지금까지 열어 둔(캐시에 있는) ipa 목록과 각각의 캐시 크기(압축 해제본·Ghidra 프로젝트)."""
     return store.list_opened()
 
 
@@ -167,6 +172,27 @@ def list_names(
     return analysis.list_names(store.get(id), other, section, filter, status, limit)
 
 
+@mcp.tool(annotations=READ)
+@_audit
+def secret_scan(id: str, scope: str = "all", reveal: bool = False) -> dict[str, Any]:
+    """알려진 형식의 키·토큰(AWS·Google·Slack·GitHub·Stripe 키, PEM 개인 키, JWT, URL 계정 등)을 찾는다.
+
+    scope: binaries(Mach-O 만) | all(리소스 포함, 기본). 값은 기본으로 가리고(앞 4자·뒤 2자)
+    fingerprint 로 같은 값인지 비교한다. reveal=true 면 원문을 준다(외부로 옮길 때는 사람이 가린다).
+    형식이 없는 임의 문자열 키는 찾지 못한다 — 의심 값은 find_strings(source_ref=…) 로 확인한다.
+    """
+    return analysis.secrets(store.get(id), scope, bool(reveal))
+
+
+@mcp.tool(annotations=READ)
+@_audit
+def pair_report(a: str, b: str, rules: str = "liapp") -> dict[str, Any]:
+    """미적용(a)·적용(b) 쌍 점검을 한 번에 요약한다: 양쪽 판정, 추가 파일, 코드(__text) 변경 여부,
+    바뀐 이름 수, 적용본에도 그대로 보이는 키·토큰(값은 가림), 엔타이틀먼트·서명 차이, 경고.
+    markdown 필드는 그대로 공유할 수 있는 요약이다(키 원문은 들어가지 않는다)."""
+    return analysis.pair_report(store.get(a), store.get(b), rules)
+
+
 @mcp.tool(annotations=DELETE)
 @_audit
 def ipa_clear(id: str) -> dict[str, Any]:
@@ -196,11 +222,18 @@ def ghidra_analyze(id: str, binary: str = "main") -> dict[str, Any]:
 @mcp.tool(annotations=READ)
 @_audit
 def ghidra_status(id: str | None = None, binary: str = "main") -> dict[str, Any]:
-    """Ghidra 분석 진행 상태. id 를 생략하면 이 워커가 맡은 모든 작업을 보여 준다."""
+    """Ghidra 분석 진행 상태. id 를 생략하면 이 워커가 맡은 모든 작업을 보여 준다.
+    상태만 보므로 워커가 꺼져 있으면 띄우지 않고, 캐시에 남은 분석 완료 표시로 답한다."""
     if id is None:
-        return ghidra_client.call("status")
-    key, _ = _key(store.get(id), binary)
-    return ghidra_client.call("status", key=key)
+        r = ghidra_client.call_if_running("status")
+        return r if r is not None else {"worker": "not_running", "jobs": [], "open_programs": [], "max_open": None}
+    ipa = store.get(id)
+    key, _ = _key(ipa, binary)
+    r = ghidra_client.call_if_running("status", key=key)
+    if r is None:
+        done = config.ghidra_marker(ipa.id, key.split("/", 1)[1]).exists()
+        r = {"key": key, "state": "done" if done else "not_started", "worker": "not_running"}
+    return r
 
 
 @mcp.tool(annotations=READ)

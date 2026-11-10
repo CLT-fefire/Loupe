@@ -12,6 +12,7 @@ import plistlib
 import shutil
 import stat
 import tempfile
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -192,14 +193,67 @@ def get(ipa_id: str) -> Ipa:
     return Ipa(id=ipa_id, sha256=meta["sha256"], source=meta["source"], root=root, app=root / meta["app"])
 
 
-def list_opened() -> list[dict]:
+def _dir_sizes(root: Path, sub: Path) -> tuple[int, int]:
+    """(root 전체 크기, 그중 sub 아래 크기). 트리를 한 번만 걷는다. 심볼릭 링크는 따라가지 않는다."""
+    total = inner = 0
+    sub_s = str(sub)
+    for dirpath, _dirs, files in os.walk(root):
+        in_sub = dirpath == sub_s or dirpath.startswith(sub_s + os.sep)
+        for f in files:
+            try:
+                n = os.lstat(os.path.join(dirpath, f)).st_size
+            except OSError:
+                continue
+            total += n
+            if in_sub:
+                inner += n
+    return total, inner
+
+
+def _analyzed_binaries(ipa: Ipa) -> list[str]:
+    """분석이 끝난 바이너리의 앱 기준 상대 경로(binary 인자에 그대로 쓸 수 있는 값)."""
+    by_folder = None
     out = []
-    if not config.CACHE_DIR.exists():
-        return out
-    for meta_path in sorted(config.CACHE_DIR.glob("*/meta.json")):
-        meta = json.loads(meta_path.read_text())
-        out.append({"id": meta_path.parent.name, "source": meta["source"]})
-    return out
+    for m in (ipa.root / "ghidra").glob("*/analyzed.json"):
+        try:
+            rel = json.loads(m.read_text()).get("rel")
+        except (OSError, ValueError):
+            rel = None
+        if not rel:
+            # 예전 표시에는 rel 이 없다. 폴더 이름은 경로의 / 를 _ 로 바꾼 것이라 바이너리 목록과 맞춰 본다
+            if by_folder is None:
+                by_folder = {config.ghidra_project_dir(ipa.id, ipa.rel(b)).name: ipa.rel(b) for b in ipa.binaries()}
+            rel = by_folder.get(m.parent.name, m.parent.name)
+        out.append(rel)
+    return sorted(out)
+
+
+def list_opened() -> dict:
+    """열어 둔 ipa 와 각각이 캐시에서 차지하는 크기. 정리는 ipa_clear 로 한다."""
+    items = []
+    if config.CACHE_DIR.exists():
+        for meta_path in sorted(config.CACHE_DIR.glob("*/meta.json")):
+            root = meta_path.parent
+            meta = json.loads(meta_path.read_text())
+            ipa = get(root.name)
+            ghidra = root / "ghidra"
+            total, ghidra_size = _dir_sizes(root, ghidra)
+            items.append(
+                {
+                    "id": root.name,
+                    "source": meta["source"],
+                    "opened": time.strftime("%Y-%m-%d %H:%M", time.localtime(meta_path.stat().st_mtime)),
+                    "size_mb": round(total / 1e6),
+                    "ghidra_mb": round(ghidra_size / 1e6),
+                    "ghidra_analyzed": _analyzed_binaries(ipa),
+                }
+            )
+    return {
+        "ipas": items,
+        "total_mb": sum(i["size_mb"] for i in items),
+        "cache_dir": str(config.CACHE_DIR),
+        "note": "필요 없는 것은 ipa_clear(id) 로 지운다. Ghidra 프로젝트가 대부분을 차지한다.",
+    }
 
 
 def clear(ipa_id: str) -> None:

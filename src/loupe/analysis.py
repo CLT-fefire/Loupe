@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from . import config, macho, names, signing
+from . import config, macho, names, secret_scan, signing, swift_small
 from .store import Ipa, LoupeError
 
 SWIFT_INLINE_LIMIT = 15  # Swift 는 이 바이트 이하 문자열을 명령어에 인라인한다
@@ -40,7 +40,9 @@ def load_rules(name: str = "liapp") -> dict:
 
 
 def _pattern(rules: dict) -> names.Pattern:
-    o = rules["obfuscated_name"]
+    o = rules.get("obfuscated_name")
+    if not o:
+        raise LoupeError("보호 판정 규칙이 아니다(obfuscated_name 이 없다). 예: rules='liapp'")
     return names.Pattern(re.compile(o["regex"]), int(o["min_len"]))
 
 
@@ -397,6 +399,7 @@ def find_strings(
     needles: list[tuple[str, re.Pattern, str]] = []
     warnings = []
     texts: list[str] = []
+    inline_texts: list[str] = []
     if query:
         texts.append(query)
     if source_ref:
@@ -411,9 +414,11 @@ def find_strings(
             needles.append((t + " (UTF-16LE)", re.compile(re.escape(t.encode("utf-16-le"))), "utf-16-le"))
             needles.append((t + " (UTF-16BE)", re.compile(re.escape(t.encode("utf-16-be"))), "utf-16-be"))
         if len(enc8) <= SWIFT_INLINE_LIMIT:
+            inline_texts.append(t)
             warnings.append(
-                f"'{t}' 는 {len(enc8)}바이트다. Swift 는 15바이트 이하 문자열을 명령어에 인라인하므로 "
-                "Swift 코드에서 쓰였다면 0건이어도 바이너리에 없다는 뜻이 아니다(Ghidra decompile 로 확인)."
+                f"'{t}' 는 {len(enc8)}바이트다. Swift 는 15바이트 이하 문자열을 명령어 즉값으로 넣으므로 "
+                "'(Swift 인라인)' 줄에서 명령어 패턴(MOVZ/MOVK·ORR)과 16바이트 상수로 따로 찾았다. 그래도 0건이 "
+                "'없다'는 확정은 아니다(실행 중 조합한 문자열 등은 못 찾는다). 찾은 address 는 decompile 로 확인한다."
             )
     if regex:
         try:
@@ -471,12 +476,42 @@ def find_strings(
                 entry["count_capped"] = f"파일당 {MAX_COUNT:,}건에서 세기를 멈췄다. 패턴을 좁힌다."
             row["per_ipa"][ipa.id] = entry
         results.append(row)
+    for t in inline_texts:
+        results.append(_inline_row(t, ipas, scope, bin_set, max_hits))
     return {
         "scope": scope,
         "ipas": {i.id: i.source for i in ipas},
         "warnings": warnings,
         "results": results,
     }
+
+
+def _inline_row(text: str, ipas: list[Ipa], scope: str, bin_set: dict[str, set], max_hits: int) -> dict:
+    """15바이트 이하 문자열을 Swift small string 으로 찾은 결과(Mach-O 만)."""
+    row: dict = {"needle": f"{text} (Swift 인라인)", "per_ipa": {}}
+    for ipa in ipas:
+        bins = bin_set.setdefault(ipa.id, set(ipa.binaries()))
+        total, files = 0, []
+        for p in _targets(ipa, scope):
+            if p not in bins:
+                continue
+            hits = swift_small.find(macho.load(p), text, MAX_COUNT)
+            if not hits:
+                continue
+            total += len(hits)
+            if len(files) < FILE_LIST_LIMIT:
+                files.append(
+                    {
+                        "path": ipa.rel(p),
+                        "count": len(hits),
+                        "hits": [
+                            {"address": hex(h.address), "offset": h.offset, "section": h.section, "how": h.how}
+                            for h in hits[:max_hits]
+                        ],
+                    }
+                )
+        row["per_ipa"][ipa.id] = {"total": total, "files": files}
+    return row
 
 
 # ── list_names ─────────────────────────────────────────────────────────
@@ -572,3 +607,130 @@ def compare_code(code_a: str, code_b: str, max_diff_lines: int = 200) -> dict:
         "diff_lines": len(diff),
         "diff": diff[:max_diff_lines],
     }
+
+
+# ── secret_scan ────────────────────────────────────────────────────────
+
+
+def secrets(ipa: Ipa, scope: str = "all", reveal: bool = False) -> dict:
+    r = secret_scan.scan(ipa, secret_scan.rules(load_rules("secret_patterns")), scope, reveal)
+    r["notes"] = [
+        "알려진 형식(AWS·Google·Slack·GitHub·Stripe 키, PEM 개인 키, JWT, URL 계정 등)만 찾는다. "
+        "형식이 없는 임의 문자열 키는 찾지 못하므로 의심 값은 find_strings(source_ref=…) 로 따로 확인한다.",
+        "public_client_key 는 앱에 들어가는 것이 전제인 키다. 노출보다 콘솔의 사용 제한 설정을 확인한다.",
+    ]
+    if not reveal:
+        r["notes"].append("값은 앞 4자·뒤 2자만 보여 준다. 같은 값인지는 fingerprint 로 비교한다. 원문은 reveal=true.")
+    return r
+
+
+# ── pair_report ────────────────────────────────────────────────────────
+
+
+def _secret_map(scan_result: dict) -> dict[str, dict]:
+    """지문 -> 항목. 같은 값이 여러 규칙에 걸리면 앞(신뢰도 높은) 규칙을 쓰고, 공개 키 표시는 하나라도 있으면 유지한다."""
+    out: dict[str, dict] = {}
+    for f in scan_result["findings"]:
+        for v in f["values"]:
+            public = f.get("public_client_key", False)
+            e = out.get(v["fingerprint"])
+            if e is None:
+                out[v["fingerprint"]] = {"rule": f["rule"], "name": f["name"], "value": v["value"], "public": public}
+            else:
+                e["public"] = e["public"] or public
+                e.setdefault("also", []).append(f["rule"])
+    return out
+
+
+def _code_comparison(a: Ipa, b: Ipa) -> tuple[dict, list[str]]:
+    """코드 바이너리를 직접 비교한다. (구조화된 결과, 결론 문장). 비교하지 못한 경우도 이유를 문장으로 남긴다."""
+    rel_a, rel_b = a.rel(a.code_binary), b.rel(b.code_binary)
+    out: dict = {"path": rel_a}
+    if rel_a != rel_b:
+        out["error"] = f"코드 바이너리가 다르다: {rel_a} vs {rel_b}"
+        return out, [f"코드 바이너리 경로가 달라({rel_a} vs {rel_b}) 코드·이름을 비교하지 못했다."]
+    try:
+        ma, mb = macho.load(a.code_binary), macho.load(b.code_binary)
+    except Exception as e:
+        out["error"] = f"Mach-O 로 읽지 못했다: {type(e).__name__}"
+        return out, [f"{rel_a} 를 읽지 못해 코드·이름을 비교하지 못했다."]
+    lines = []
+    if ma.data == mb.data:
+        out["identical"] = True
+        return out, [f"{rel_a} 가 두 ipa 에서 바이트까지 같다. 코드·이름 모두 바뀌지 않았다."]
+    sec = _section_changes(ma, mb)
+    if sec is None:
+        out["sections"] = None
+        lines.append("섹션 배치가 달라 코드(__text) 변경 여부를 바이트로 비교하지 못했다.")
+    else:
+        out["sections"] = {k: v["changed_bytes"] for k, v in sec.items()}
+        if "__TEXT,__text" in sec:
+            lines.append(f"코드(__text)가 {sec['__TEXT,__text']['changed_bytes']:,}바이트 바뀌었다.")
+        else:
+            lines.append("코드(__text)는 바뀌지 않았다. 코드에 든 값·로직은 이 보호로 가려지지 않는다.")
+    out["names"] = _name_changes(ma, mb, 5)
+    for name_sec, v in out["names"].items():
+        if v["paired"]:
+            if v["renamed"]:
+                lines.append(f"{name_sec}: {v['total']:,}개 중 {v['renamed']:,}개 이름이 바뀌었다.")
+            else:
+                lines.append(f"{name_sec}: 바뀐 이름이 없다({v['total']:,}개).")
+        else:
+            lines.append(
+                f"{name_sec}: 섹션 크기가 달라 이름을 짝지어 비교하지 못했다(a 에만 {v['only_a']:,}개, b 에만 {v['only_b']:,}개)."
+            )
+    return out, lines
+
+
+def pair_report(a: Ipa, b: Ipa, rules_name: str = "liapp") -> dict:
+    """미적용(a)·적용(b) 쌍 점검을 한 번에 요약한다. 값은 가린 채로만 담는다(공유용 markdown 포함)."""
+    pa, pb = protection_check(a, rules_name), protection_check(b, rules_name)
+    d = diff(a, b, samples=5)  # 파일·엔타이틀먼트·서명·경고만 쓴다(코드 비교는 아래에서 직접 한다)
+    code, code_lines = _code_comparison(a, b)
+    sa, sb = _secret_map(secrets(a)), _secret_map(secrets(b))
+    still = [{"fingerprint": fp, **sb[fp]} for fp in sb if fp in sa]
+    only_b = [{"fingerprint": fp, **sb[fp]} for fp in sb if fp not in sa]
+    ents = d["entitlements"] if isinstance(d["entitlements"], dict) else {}
+
+    conclusions = [f"판정: a={pa['verdict']}, b={pb['verdict']} ({pb['solution']})", *code_lines]
+    secret_still = [x for x in still if not x["public"]]
+    if secret_still:
+        conclusions.append(f"알려진 형식의 비공개 키·토큰 {len(secret_still)}개가 적용본에도 그대로 있다.")
+    if ents:
+        conclusions.append(f"엔타이틀먼트가 바뀐 번들 {len(ents)}개: " + ", ".join(f"{k}({', '.join(v)})" for k, v in ents.items()))
+    conclusions += [f"주의: {w}" for w in d["warnings"]]
+
+    report = {
+        "a": {"id": a.id, "source": a.source, "verdict": pa["verdict"]},
+        "b": {"id": b.id, "source": b.source, "verdict": pb["verdict"]},
+        "conclusions": conclusions,
+        "added_files": d["files"]["only_b"],
+        "removed_files": d["files"]["only_a"],
+        "code_binary": code,
+        "entitlements": d["entitlements"],
+        "signature": d["signature"],
+        "secrets": {"still_visible_in_b": still, "only_in_b": only_b, "count_a": len(sa), "count_b": len(sb)},
+    }
+    report["markdown"] = _report_md(report)
+    return report
+
+
+def _report_md(r: dict) -> str:
+    lines = [
+        "## ipa 보호 적용 점검",
+        "",
+        f"- a(미적용): `{Path(r['a']['source']).name}` — {r['a']['verdict']}",
+        f"- b(적용): `{Path(r['b']['source']).name}` — {r['b']['verdict']}",
+        "",
+        "### 결론",
+        *[f"- {c}" for c in r["conclusions"]],
+        "",
+        "### 추가된 파일",
+        *([f"- `{f['path']}` ({f['size']:,}바이트)" for f in r["added_files"]] or ["- 없음"]),
+    ]
+    s = r["secrets"]["still_visible_in_b"]
+    if s:
+        lines += ["", "### 적용본에도 그대로 보이는 키·토큰 (값은 가림)", "| 종류 | 값 | 비고 |", "|:--|:--|:--|"]
+        lines += [f"| {x['name']} | `{x['value']}` | {'클라이언트 키(사용 제한 확인)' if x['public'] else ''} |" for x in s]
+    lines += ["", "_Loupe pair_report 로 만들었다. 정적 흔적만 본다(실행 중 보호는 확인하지 않는다)._"]
+    return "\n".join(lines)

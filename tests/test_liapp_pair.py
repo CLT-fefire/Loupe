@@ -141,3 +141,34 @@ def test_symbol_summary(pair):
     s = analysis.info(a)["main_binary"]["symbols"]
     assert s == {"total": 3984, "imported": 3931, "exported": 52, "local": 1}
     assert s["local"] <= 5  # 릴리스(QA_QARelease) 빌드는 심볼이 제거돼 있다
+
+
+def test_short_swift_string_found_inline(pair):
+    """'Bearer' 는 문자열 섹션에 없고 명령어 즉값으로만 있다(2026-11-10, Ghidra 디컴파일로 확인)."""
+    a, b = pair
+    r = analysis.find_strings([a, b], query="Bearer", scope="main")
+    plain, inline = r["results"]
+    assert plain["per_ipa"][PLAIN_ID]["total"] == 0
+    for i in (PLAIN_ID, LIAPP_ID):
+        hit = inline["per_ipa"][i]["files"][0]["hits"][0]
+        assert hit["address"] == "0x1006f9950" and hit["how"] == "instructions"
+
+
+def test_secret_scan_and_pair_report(pair):
+    a, b = pair
+    s = analysis.secrets(b)
+    rules = {f["rule"]: f["distinct"] for f in s["findings"]}
+    # JWT = TranslateManager.h:13 하드코딩 값. plist_secret 1건은 GoogleService-Info.plist 의 API_KEY(구글 키와 같은 값)
+    assert rules == {"jwt": 1, "google_api_key": 2, "plist_secret": 1}
+    r = analysis.pair_report(a, b)
+    assert (r["a"]["verdict"], r["b"]["verdict"]) == ("not_applied", "applied")
+    assert any("__text" in c and "바뀌지 않았다" in c for c in r["conclusions"])
+    assert r["code_binary"]["names"]["__objc_classname"]["renamed"] == 1475
+    assert "__TEXT,__text" not in r["code_binary"]["sections"]
+    still = r["secrets"]["still_visible_in_b"]
+    assert len(still) == 3  # 같은 값은 지문으로 합친다
+    merged = [x for x in still if x.get("also")]
+    assert merged and all(x["public"] and x["rule"] == "google_api_key" for x in merged)
+    assert "eyJh…" in r["markdown"]
+    jwt = next(v for f in analysis.secrets(b, reveal=True)["findings"] if f["rule"] == "jwt" for v in f["values"])
+    assert jwt["value"] not in r["markdown"] and jwt["value"] not in str(r)

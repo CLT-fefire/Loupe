@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from typing import NamedTuple
 
 from . import config
 
@@ -36,6 +37,7 @@ _programs: dict[str, object] = {}  # key -> Program
 _key_locks: dict[str, threading.Lock] = {}  # 바이너리별 열기 잠금(큰 프로그램을 여는 동안 다른 바이너리를 막지 않게)
 _inuse: dict[str, int] = {}  # key -> 지금 쓰고 있는 요청 수
 _last_used: dict[str, float] = {}
+_indexes: dict[str, "FuncIndex"] = {}  # key -> 함수 이름 색인(프로그램을 닫으면 함께 버린다)
 _last_activity = time.time()
 
 
@@ -43,13 +45,8 @@ def _log(msg: str) -> None:
     print(f"[loupe-worker {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def _project_dir(ipa_id: str, rel: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", rel)
-    return config.CACHE_DIR / ipa_id / "ghidra" / safe
-
-
-def _marker(ipa_id: str, rel: str) -> Path:
-    return _project_dir(ipa_id, rel) / "analyzed.json"
+_project_dir = config.ghidra_project_dir
+marker = config.ghidra_marker
 
 
 # ── 분석 ───────────────────────────────────────────────────────────────
@@ -87,7 +84,7 @@ def _program(key: str):
         if key in _programs:
             return _programs[key]
     ipa_id, rel = key.split("/", 1)
-    if not _marker(ipa_id, rel).exists():
+    if not marker(ipa_id, rel).exists():
         job = _jobs.get(key)
         state = job["state"] if job else "없음"
         raise RuntimeError(f"아직 분석되지 않았다(상태: {state}). analyze 를 먼저 호출하고 끝날 때까지 기다린다.")
@@ -96,7 +93,7 @@ def _program(key: str):
             if key in _programs:
                 return _programs[key]
         proj = _open_project(key, ipa_id, rel)
-        name = json.loads(_marker(ipa_id, rel).read_text())["program"]
+        name = json.loads(marker(ipa_id, rel).read_text())["program"]
         prog = proj.openProgram("/", name, False)
         with _lock:
             _programs[key] = prog
@@ -107,6 +104,7 @@ def _close(key: str) -> None:
     """프로그램과 프로젝트를 닫는다. 호출하는 쪽이 _lock 을 잡고 있어야 한다."""
     proj = _projects.pop(key, None)
     _programs.pop(key, None)
+    _indexes.pop(key, None)
     _last_used.pop(key, None)
     if proj is not None:
         try:
@@ -139,10 +137,16 @@ class _use:
         self.key = key
 
     def __enter__(self):
-        prog = _program(self.key)
+        # 쓰는 중 표시를 먼저 한다. 프로그램을 받은 뒤에 표시하면 그 사이에 다른 요청의 _evict 가 닫을 수 있다.
         with _lock:
             _inuse[self.key] = _inuse.get(self.key, 0) + 1
             _last_used[self.key] = time.time()
+        try:
+            prog = _program(self.key)
+        except BaseException:
+            with _lock:
+                _inuse[self.key] = max(0, _inuse.get(self.key, 0) - 1)
+            raise
         _evict(keep=self.key)
         return prog
 
@@ -182,9 +186,9 @@ def _analyze(key: str) -> None:
         pyghidra.analyze(program)
         proj.save(program)
         finished = time.time()
-        _marker(ipa_id, rel).write_text(
+        marker(ipa_id, rel).write_text(
             json.dumps(
-                {"program": name, "finished": finished, "seconds": round(finished - job["started"]), "size": path.stat().st_size}
+                {"program": name, "rel": rel, "finished": finished, "seconds": round(finished - job["started"]), "size": path.stat().st_size}
             )
         )
         with _lock:
@@ -194,6 +198,9 @@ def _analyze(key: str) -> None:
         _log(f"분석 끝 {key} ({finished - job['started']:.0f}s)")
         _evict(keep=key)
     except Exception as e:
+        # 반쯤 연 프로젝트·프로그램을 닫아 둔다. 그대로 두면 다시 분석할 때 같은 프로그램을 한 번 더 연다.
+        with _lock:
+            _close(key)
         job.update(state="error", finished=time.time(), error=f"{type(e).__name__}: {e}")
         _log(f"분석 실패 {key}\n{traceback.format_exc()}")
 
@@ -227,10 +234,85 @@ def _func_info(f) -> dict:
     }
 
 
-def _find_function(prog, target: str):
+class FuncEntry(NamedTuple):
+    name: str  # 네임스페이스를 붙인 이름 (Class::selector)
+    short: str  # 네임스페이스 없는 이름
+    entry: str  # 시작 주소 문자열 (str(Address))
+    is_code: bool  # 실행 가능한 메모리 블록에 있는가
+
+
+class FuncIndex:
+    """함수 이름 색인. 파이썬 쪽에 한 번 만들어 두고 검색·이름 조회에 쓴다.
+
+    JPype 로 함수 11.5만 개를 매번 순회하면 검색 한 번에 0.7~2초가 걸렸다. 병렬 16건이면 GIL 때문에 건마다
+    40~47초까지 늘었다(2026-11-09 loupe.log 실측). 분석이 끝난 프로그램은 바꾸지 않으므로 색인은 닫을 때까지 유효하다.
+    """
+
+    def __init__(self, rows: list[FuncEntry]):
+        self.rows = rows
+        self.by_name: dict[str, list[FuncEntry]] = {}
+        for r in rows:
+            self.by_name.setdefault(r.name, []).append(r)
+            if r.short != r.name:
+                self.by_name.setdefault(r.short, []).append(r)
+
+    def search(self, rx: re.Pattern, limit: int, include_non_code: bool) -> tuple[list[FuncEntry], int, int]:
+        """(보여 줄 항목, 맞은 수, 걸러 낸 non-code 수)"""
+        out, total, non_code = [], 0, 0
+        for r in self.rows:
+            if not (rx.search(r.name) or rx.search(r.entry)):
+                continue
+            if not r.is_code and not include_non_code:
+                non_code += 1
+                continue
+            total += 1
+            if len(out) < limit:
+                out.append(r)
+        return out, total, non_code
+
+    def exact(self, name: str) -> list[FuncEntry]:
+        """전체 이름이나 짧은 이름이 name 과 같은 함수."""
+        return list(self.by_name.get(name, []))
+
+
+def _build_index(prog) -> FuncIndex:
+    mem = prog.getMemory()
+    rows = []
+    for f in prog.getFunctionManager().getFunctions(True):
+        entry = f.getEntryPoint()
+        block = mem.getBlock(entry)
+        rows.append(FuncEntry(str(f.getName(True)), str(f.getName()), str(entry), block is not None and block.isExecute()))
+    return FuncIndex(rows)
+
+
+def _index(key: str, prog) -> FuncIndex:
+    """그 프로그램의 함수 색인. 처음 한 번만 만든다(같은 바이너리 요청이 동시에 와도 한 번)."""
+    with _lock:
+        idx = _indexes.get(key)
+    if idx is not None:
+        return idx
+    with _key_lock(key):
+        with _lock:
+            idx = _indexes.get(key)
+        if idx is None:
+            t = time.time()
+            idx = _build_index(prog)
+            with _lock:
+                if _programs.get(key) is prog:  # 만드는 사이 닫혔으면 버린다
+                    _indexes[key] = idx
+            _log(f"함수 색인 {key}: {len(idx.rows)}개 {time.time() - t:.1f}s")
+    return idx
+
+
+def _function_at(prog, entry: str):
+    return prog.getFunctionManager().getFunctionAt(prog.getAddressFactory().getAddress(entry))
+
+
+def _find_function(prog, target: str, get_index):
     """함수 이름 또는 주소로 찾는다. 주소는 0x 를 붙여야 확실하다.
 
     'add', 'fade' 처럼 16진수 글자로만 된 이름이 주소로 오해되지 않게, 0x 가 없으면 이름을 먼저 찾는다.
+    get_index: 이름으로 찾을 때만 부른다(주소 지정이면 색인을 만들지 않는다).
     """
     fm = prog.getFunctionManager()
     space = prog.getAddressFactory().getDefaultAddressSpace()
@@ -243,11 +325,13 @@ def _find_function(prog, target: str):
 
     if re.fullmatch(r"0x[0-9a-fA-F]+", target):
         return by_address(target)
-    exact = [f for f in fm.getFunctions(True) if str(f.getName(True)) == target or str(f.getName()) == target]
+    exact = get_index().exact(target)
     if len(exact) == 1:
-        return exact[0]
+        f = _function_at(prog, exact[0].entry)
+        if f is not None:
+            return f
     if len(exact) > 1:
-        raise RuntimeError(f"이름이 같은 함수가 {len(exact)}개다. 주소(0x…)로 지정한다: {[str(f.getEntryPoint()) for f in exact[:10]]}")
+        raise RuntimeError(f"이름이 같은 함수가 {len(exact)}개다. 주소(0x…)로 지정한다: {[r.entry for r in exact[:10]]}")
     if re.fullmatch(r"[0-9a-fA-F]{6,}", target):  # 이름이 없고 주소처럼 생겼으면 주소로 한 번 더
         return by_address(target)
     raise RuntimeError("그 이름의 함수가 없다. search_functions 로 정확한 이름을 찾는다.")
@@ -262,27 +346,20 @@ def op_search_functions(key: str, pattern: str, limit: int = 50, include_non_cod
     """
     rx = re.compile(pattern, re.I)
     with _use(key) as prog:
-        return _search_functions(prog, rx, limit, include_non_code)
+        return _search_functions(prog, _index(key, prog), rx, limit, include_non_code)
 
 
-def _search_functions(prog, rx, limit: int, include_non_code: bool) -> dict:
+def _search_functions(prog, idx: FuncIndex, rx, limit: int, include_non_code: bool) -> dict:
+    rows, total, non_code = idx.search(rx, limit, include_non_code)
     mem = prog.getMemory()
-    out, total, non_code = [], 0, 0
-    for f in prog.getFunctionManager().getFunctions(True):
-        name = str(f.getName(True))
-        if not (rx.search(name) or rx.search(str(f.getEntryPoint()))):
-            continue
-        block = mem.getBlock(f.getEntryPoint())
-        is_code = block is not None and block.isExecute()
-        if not is_code and not include_non_code:
-            non_code += 1
-            continue
-        total += 1
-        if len(out) < limit:
-            info = _func_info(f)
-            if not is_code:
-                info["block"] = str(block.getName()) if block else None
-            out.append(info)
+    out = []
+    for r in rows:
+        f = _function_at(prog, r.entry)
+        info = _func_info(f) if f is not None else {"name": r.name, "entry": r.entry, "size": None}
+        if not r.is_code:
+            block = mem.getBlock(prog.getAddressFactory().getAddress(r.entry))
+            info["block"] = str(block.getName()) if block else None
+        out.append(info)
     result = {"matched": total, "functions": out}
     if non_code:
         result["excluded_non_code"] = non_code
@@ -294,7 +371,7 @@ def op_decompile(key: str, target: str, timeout: int = 60, max_chars: int = 2000
     from ghidra.util.task import ConsoleTaskMonitor
 
     with _use(key) as prog:
-        f = _find_function(prog, target)
+        f = _find_function(prog, target, lambda: _index(key, prog))
         ifc = DecompInterface()
         try:
             ifc.openProgram(prog)
@@ -378,12 +455,13 @@ def _refs_to(prog, addr, limit: int, hop: int = 0) -> list[dict]:
 
 def op_xrefs(key: str, target: str, kind: str = "auto", limit: int = 50) -> dict:
     with _use(key) as prog:
-        return _xrefs(prog, target, kind, limit)
+        return _xrefs(prog, lambda: _index(key, prog), target, kind, limit)
 
 
-def _xrefs(prog, target: str, kind: str, limit: int) -> dict:
+def _xrefs(prog, get_index, target: str, kind: str, limit: int) -> dict:
     mem = prog.getMemory()
-    space = prog.getAddressFactory().getDefaultAddressSpace()
+    factory = prog.getAddressFactory()
+    space = factory.getDefaultAddressSpace()
     targets = []
 
     if kind in ("auto", "address") and re.fullmatch(r"0x[0-9a-fA-F]+", target):
@@ -391,9 +469,10 @@ def _xrefs(prog, target: str, kind: str, limit: int) -> dict:
     if kind in ("auto", "symbol") and not targets:
         for s in prog.getSymbolTable().getSymbols(target):
             targets.append(("symbol", s.getAddress()))
-        for f in prog.getFunctionManager().getFunctions(True):
-            if str(f.getName(True)) == target and ("symbol", f.getEntryPoint()) not in targets:
-                targets.append(("symbol", f.getEntryPoint()))
+        for r in get_index().exact(target):
+            addr = factory.getAddress(r.entry)
+            if r.name == target and ("symbol", addr) not in targets:
+                targets.append(("symbol", addr))
     if kind in ("auto", "string") and not targets:
         from jpype import JArray, JByte
 
@@ -428,7 +507,7 @@ def _xrefs(prog, target: str, kind: str, limit: int) -> dict:
 def op_analyze(key: str, path: str) -> dict:
     ipa_id, rel = key.split("/", 1)
     with _lock:
-        if _marker(ipa_id, rel).exists():
+        if marker(ipa_id, rel).exists():
             return {"state": "done", "cached": True}
         job = _jobs.get(key)
         if job and job["state"] in ("queued", "running"):
@@ -462,10 +541,10 @@ def _status_one(key: str) -> dict:
     ipa_id, rel = key.split("/", 1)
     job = _jobs.get(key)
     if job is None:
-        return {"key": key, "state": "done" if _marker(ipa_id, rel).exists() else "not_started"}
+        return {"key": key, "state": "done" if marker(ipa_id, rel).exists() else "not_started", "worker": "running"}
     # 메인 스레드가 job 을 바꾸는 중일 수 있으므로 값은 한 번씩만 읽는다
     state, started, finished = job["state"], job.get("started"), job.get("finished")
-    out = {"key": key, "state": state}
+    out = {"key": key, "state": state, "worker": "running"}
     elapsed = round((finished or time.time()) - started) if started else None
     if elapsed is not None:
         out["elapsed_s"] = elapsed
@@ -496,7 +575,7 @@ def op_status(key: str | None = None) -> dict:
     with _lock:
         keys = list(_jobs)
         open_programs = sorted(_programs, key=lambda k: -_last_used.get(k, 0.0))
-    return {"jobs": [_status_one(k) for k in keys], "open_programs": open_programs, "max_open": MAX_OPEN}
+    return {"worker": "running", "jobs": [_status_one(k) for k in keys], "open_programs": open_programs, "max_open": MAX_OPEN}
 
 
 def op_forget(ipa_id: str) -> dict:
@@ -506,7 +585,8 @@ def op_forget(ipa_id: str) -> dict:
         busy = [k for k, j in _jobs.items() if k.startswith(prefix) and j["state"] in ("queued", "running")]
         if busy:
             raise RuntimeError(f"분석 중이라 지울 수 없다: {busy}. 끝난 뒤 다시 시도한다.")
-        if any(_inuse.get(k, 0) for k in _programs if k.startswith(prefix)):
+        # 여는 중인 프로그램도 _use 가 _inuse 를 먼저 올려 두므로 _inuse 전체를 본다
+        if any(n for k, n in _inuse.items() if k.startswith(prefix)):
             raise RuntimeError("이 ipa 를 조회하는 요청이 진행 중이다. 끝난 뒤 다시 시도한다.")
         closed = sorted({k for k in list(_programs) + list(_projects) if k.startswith(prefix)})
         for k in closed:
@@ -557,8 +637,13 @@ class Handler(socketserver.StreamRequestHandler):
                 with _lock:
                     _inflight -= 1
                 _last_activity = time.time()
-            self.wfile.write((json.dumps(resp, ensure_ascii=False) + "\n").encode())
-            self.wfile.flush()
+            try:
+                self.wfile.write((json.dumps(resp, ensure_ascii=False) + "\n").encode())
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                # 클라이언트가 기다리다 먼저 끊었다(타임아웃). 결과는 버린다.
+                _log(f"{op} 응답 전에 클라이언트가 끊었다")
+                return
 
 
 class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):

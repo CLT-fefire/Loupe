@@ -24,6 +24,7 @@ class Section:
     name: str
     offset: int  # 파일 기준 오프셋 (fat 이면 slice 오프셋을 더한 값)
     size: int
+    addr: int = 0  # 가상 주소(Ghidra 주소와 같다)
 
     @property
     def key(self) -> str:
@@ -164,7 +165,7 @@ def _load(path_str: str, mtime: float) -> MachO:
         if s.offset == 0 and s.size and s.segment_name in ("__DATA", "__DATA_CONST", "__DATA_DIRTY"):
             # zerofill(__bss, __common) 은 파일에 없다
             continue
-        m.sections.append(Section(s.segment_name, s.name, off + s.offset, s.size))
+        m.sections.append(Section(s.segment_name, s.name, off + s.offset, s.size, s.virtual_address))
     return m
 
 

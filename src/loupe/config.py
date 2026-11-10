@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 
@@ -34,6 +35,18 @@ GHIDRA_INSTALL_DIR = Path(
 ).expanduser()
 
 LOG_FILE = CACHE_DIR / "loupe.log"
+
+
+# Ghidra 캐시 배치. 워커(분석)와 MCP 서버(상태·목록)가 같이 쓰므로 여기 한 곳에 둔다.
+# 서버는 JVM 을 띄우는 워커 모듈을 import 하지 않는다.
+def ghidra_project_dir(ipa_id: str, rel: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", rel)
+    return CACHE_DIR / ipa_id / "ghidra" / safe
+
+
+def ghidra_marker(ipa_id: str, rel: str) -> Path:
+    """분석 완료 표시(analyzed.json). 내용: program, rel, finished, seconds, size."""
+    return ghidra_project_dir(ipa_id, rel) / "analyzed.json"
 
 
 def is_under(path: Path, roots: list[Path]) -> bool:

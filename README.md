@@ -16,7 +16,7 @@ App Store에서 받은 ipa(FairPlay 암호화)는 분석할 수 없다.
 cd /Users/Shared/Source/Company/Loupe
 uv sync
 uv run pytest -q                                   # 정적 분석 테스트(빠름)
-LOUPE_GHIDRA_TESTS=1 uv run pytest tests/test_ghidra_pair.py -q   # Ghidra 통합(약 1분, 분석된 캐시 필요)
+LOUPE_GHIDRA_TESTS=1 uv run pytest tests/test_ghidra_pair.py -q   # Ghidra 통합(약 15초, 분석된 캐시 필요)
 ```
 
 Claude Code에 등록(사용자 범위):
@@ -30,13 +30,15 @@ claude mcp add --scope user loupe -- /Users/Shared/Source/Company/Loupe/.venv/bi
 | 도구 | 하는 일 |
 |:--|:--|
 | `ipa_open(path)` | ipa를 풀어 캐시에 넣고 id를 돌려준다. 같은 ipa(sha256)는 다시 풀지 않는다 |
-| `ipa_list()` / `ipa_clear(id)` | 캐시 목록 보기 / 지우기 |
+| `ipa_list()` / `ipa_clear(id)` | 캐시 목록과 ipa 별 크기(압축 해제본·Ghidra 프로젝트, 분석된 바이너리) 보기 / 지우기 |
 | `ipa_info(id)` | 번들 정보, 프로파일 종류, 빌드 종류 추정, 메인 바이너리 요약 |
 | `protection_check(id, rules)` | 보호 적용 판정(`applied` / `partial` / `not_applied` / `unknown`)과 근거. ObjC 클래스 이름 섹션이 없으면 `unknown` |
 | `ipa_diff(a, b)` | 파일·섹션·이름·엔타이틀먼트·서명 차이 |
-| `find_strings(ids, query\|regex\|source_ref, scope)` | 문자열 위치와 건수. `source_ref="경로:줄"`이면 그 줄의 리터럴을 찾는다 |
+| `find_strings(ids, query\|regex\|source_ref, scope)` | 문자열 위치와 건수. `source_ref="경로:줄"`이면 그 줄의 리터럴을 찾는다. 15바이트 이하는 `(Swift 인라인)` 줄에 명령어 즉값으로 찾은 결과(주소)를 따로 준다 |
+| `secret_scan(id, scope, reveal)` | 알려진 형식의 키·토큰(AWS·Google·Slack·GitHub·Stripe 키, PEM 개인 키, JWT, URL 계정 등). 값은 가리고 `fingerprint` 로 비교한다 |
+| `pair_report(a, b, rules)` | 미적용(a)·적용(b) 쌍 요약: 판정, 추가 파일, 코드 변경 여부, 바뀐 이름 수, 적용본에도 남은 키·토큰, 엔타이틀먼트. 공유용 `markdown` 포함(키 원문 없음) |
 | `list_names(id, other_id, section, filter, status)` | 클래스·메서드·프로퍼티 이름. 쌍으로 주면 바뀐 이름과 보존된 이름을 나눈다 |
-| `ghidra_analyze(id, binary)` / `ghidra_status` | Ghidra 분석을 백그라운드로 시작하고 상태를 본다. 상태에는 지난 분석 속도로 낸 예상 시간(`estimated_remaining_s`)이 붙는다 |
+| `ghidra_analyze(id, binary)` / `ghidra_status` | Ghidra 분석을 백그라운드로 시작하고 상태를 본다. 상태에는 지난 분석 속도로 낸 예상 시간(`estimated_remaining_s`)이 붙는다. `ghidra_status` 는 워커가 꺼져 있으면 띄우지 않고 캐시의 완료 표시로 답한다(`worker: not_running`) |
 | `search_functions` / `decompile` / `xrefs` | 분석된 바이너리에서 함수 검색, 디컴파일, 참조 추적. ObjC 셀렉터는 `objc_stub` 을 부르는 실제 함수(`callers`)까지 보여 준다 |
 | `compare_function(a, b, function)` | 같은 함수를 두 ipa 에서 디컴파일해 비교한다. `names_only=true` 면 로직은 같고 이름만 바뀐 것이다 |
 
@@ -58,8 +60,9 @@ claude mcp add --scope user loupe -- /Users/Shared/Source/Company/Loupe/.venv/bi
 - **`source_ref`** 는 빈 문자열 `""` 을 버린다(모든 위치에 맞아 버린다). Swift 보간 `"a\(x)b"` 은 조각(`a`, `b`)으로 나눠 찾고, `'"'` 같은 문자 리터럴은 무시한다.
 - **`decompile(function=…)`** 에서 주소는 `0x` 를 붙인다. 붙이지 않으면 이름을 먼저 찾는다(`add`·`fade` 같은 이름이 주소로 오해되지 않게).
 
-- **15바이트 이하 Swift 문자열**은 명령어 안에 인라인되므로 `find_strings`에서 0건이 나올 수 있다. 0건이 곧 "없다"는 뜻은 아니므로 `decompile`로 확인한다.
-- **찾은 값은 원문으로 돌려준다.** 결과를 외부(Confluence·메일 등)로 옮길 때 키나 토큰은 사람이 가린다.
+- **15바이트 이하 Swift 문자열**은 문자열 섹션에 없고 명령어 즉값으로 들어간다(워드0 = 바이트 0..7, 워드1 = 바이트 8..14 + 맨 위 바이트 `0xE0|길이`, 비ASCII 는 `0xA0|길이`). `find_strings` 는 `__text` 의 MOVZ/MOVK·ORR 비트마스크로 두 워드를 가까이(12개 명령어 안) 만드는 곳과, 데이터 섹션의 16바이트 상수를 따로 찾아 `(Swift 인라인)` 줄에 주소를 준다. 실행 중에 조합한 문자열은 못 찾으므로 0건이 확정은 아니다. 주소는 `decompile(function="0x…")` 로 확인한다.
+- **`secret_scan`** 은 형식이 알려진 값만 찾는다(`src/loupe/rules/secret_patterns.yaml`). 형식 없는 임의 문자열 키는 못 찾는다 — 2026-11-10 실측 쌍에서 하드코딩 3건 중 JWT 1건만 잡히고 18자·8자 값은 안 잡혔다. 그런 값은 `find_strings(source_ref=…)` 로 확인한다. 바이너리 plist(컴파일된 `.plist`·`.strings`)는 XML 로 바꿔서 찾고(위치의 offset 은 없다), 미디어·폰트와 64MB 넘는 리소스는 건너뛴다(`skipped_files`).
+- **`find_strings`·`list_names`·`decompile` 은 찾은 값을 원문으로 돌려준다.** 결과를 외부(Confluence·메일 등)로 옮길 때 키나 토큰은 사람이 가린다. `secret_scan`·`pair_report` 는 값을 가린다(16자 이상이면 앞 4자·뒤 2자, 짧으면 길이만). 같은 값인지는 `fingerprint` 로 본다. 지문은 이 Mac 의 캐시 폴더에만 있는 키(`fingerprint.key`, 권한 0600)로 만든 HMAC 이라 밖에서 되돌릴 수 없다. 원문은 `reveal=true` 일 때만 주고, 감사 로그에 `reveal` 여부를 남긴다.
 - **감사 로그**(`~/Library/Caches/Loupe/loupe.log`)에는 도구 이름, ipa id, 결과 크기, 소요 시간만 남긴다. 찾은 값은 남기지 않는다.
 - 프로비저닝 프로파일의 기기 UDID 목록은 개수만 보여 준다.
 - ipa를 풀 때 경로 이탈(zip slip), 심볼릭 링크, 4GB 초과 압축 폭탄을 거부한다.
@@ -70,6 +73,7 @@ Ghidra(JVM)는 MCP 서버와 다른 프로세스(`loupe.ghidra_worker`)에서 �
 
 - **병렬 호출**: 소켓 대기열을 128 로 늘렸고, 연결이 잠깐 거절되면 클라이언트가 다시 시도한다. 워커가 죽었다는 판단도 여러 번 거절된 뒤에만 한다.
 - **워커는 하나만 뜬다.** MCP 서버가 여럿(세션 여러 개)이어도 띄울 때 파일 잠금(`ghidra.spawn.lock`)을 건다. 워커도 이미 살아 있는 워커의 소켓을 빼앗지 않는다.
+- **함수 이름 색인**: 프로그램마다 처음 조회할 때 함수 이름 목록을 한 번 만들어 두고, `search_functions`·이름으로 하는 `decompile`·`xrefs(kind=symbol)` 가 이 목록을 쓴다. 프로그램을 닫으면 함께 버린다. 예전에는 호출마다 함수 11.5만 개를 JVM 에서 하나씩 꺼내 읽었다.
 - **`ipa_clear`** 는 워커가 그 ipa 의 프로젝트를 열어 두고 있으면 먼저 닫는다. 분석 중이면 거부한다.
 - **워커 로그**(`ghidra-worker.log`)에는 실패한 op 이름과 예외 종류만 남긴다. 검색어처럼 사용자가 넣은 값이 든 메시지는 남기지 않는다.
 

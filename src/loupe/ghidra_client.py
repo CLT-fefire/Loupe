@@ -87,18 +87,39 @@ def _spawn() -> None:
     raise LoupeError(f"Ghidra 워커가 {START_TIMEOUT}초 안에 뜨지 않았다. 로그: {config.CACHE_DIR / 'ghidra-worker.log'}")
 
 
+class _NotRunning(Exception):
+    """소켓에 붙지 못했다(소켓 파일이 없거나 여러 번 거절됨) = 워커가 없다."""
+
+
 def call_if_running(op: str, wait: float = 60, **args) -> dict | None:
-    """워커가 떠 있을 때만 부른다(워커를 새로 띄우지 않는다)."""
-    if not _alive():
+    """워커가 떠 있을 때만 부른다(워커를 새로 띄우지 않는다). 없으면 None.
+
+    ping 응답(2초)으로 판단하지 않는다 — 바쁜 워커가 늦게 답하면 '없다'로 오판한다. 연결이 되면
+    떠 있는 것이고, 응답이 늦으면 call 과 같이 오류로 알린다."""
+    if not os.path.exists(SOCK):
         return None
-    return call(op, wait=wait, **args)
+    try:
+        return _request(op, wait, **args)
+    except _NotRunning:
+        return None
 
 
 def call(op: str, wait: float = 300, **args) -> dict:
     """op 를 부르고 결과를 기다린다. wait 는 응답을 기다리는 최대 초(소켓 타임아웃)."""
     ensure_worker()
     try:
-        with _connect_retry(wait) as s:
+        return _request(op, wait, **args)
+    except _NotRunning as e:
+        raise LoupeError(f"Ghidra 워커와 통신하지 못했다({op}): {e.__cause__}") from e
+
+
+def _request(op: str, wait: float, **args) -> dict:
+    try:
+        s = _connect_retry(wait)
+    except (FileNotFoundError, ConnectionRefusedError, BlockingIOError) as e:
+        raise _NotRunning() from e
+    try:
+        with s:
             s.sendall((json.dumps({"op": op, **args}) + "\n").encode())
             buf = b""
             while not buf.endswith(b"\n"):
