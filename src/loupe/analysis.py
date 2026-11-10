@@ -60,7 +60,10 @@ def info(ipa: Ipa) -> dict:
         try:
             m = macho.load(b)
             s = m.summary()
-            binaries.append({"path": ipa.rel(b), "size": s["size"], "fairplay_encrypted": s["fairplay_encrypted"]})
+            row = {"path": ipa.rel(b), "size": s["size"], "fairplay_encrypted": s["fairplay_encrypted"]}
+            if s["hardening"]["issues"]:
+                row["hardening_issues"] = s["hardening"]["issues"]
+            binaries.append(row)
         except Exception as e:  # 깨진 파일이 있어도 나머지는 보여 준다
             binaries.append({"path": ipa.rel(b), "error": str(e)})
     hints = []
@@ -88,6 +91,12 @@ def info(ipa: Ipa) -> dict:
         "main_binary": main.summary(),
         "binaries": binaries,
     }
+
+
+def _hardening_changes(ma: macho.MachO, mb: macho.MachO) -> dict:
+    """a·b 에서 값이 다른 하드닝 플래그만 {플래그: [a, b]}. 보호 솔루션이 다시 링크하며 바꿨는지 본다."""
+    ha, hb = ma.hardening(), mb.hardening()
+    return {k: [ha[k], hb[k]] for k in ha if k != "issues" and ha[k] != hb[k]}
 
 
 # ── protection_check ───────────────────────────────────────────────────
@@ -259,6 +268,9 @@ def diff(a: Ipa, b: Ipa, samples: int = 10) -> dict:
             entry["sections"] = sec
             if not sec:
                 entry["note"] = "모든 섹션 내용이 같다. 서명·링크 정보(__LINKEDIT, 헤더)만 다르다"
+        hard = _hardening_changes(ma, mb)
+        if hard:
+            entry["hardening"] = hard
         if rel in name_bins or (sec and any(k.endswith(tuple(macho.NAME_SECTIONS)) for k in sec)):
             entry["names"] = _name_changes(ma, mb, samples)
         binaries[rel] = entry
@@ -712,6 +724,12 @@ def pair_report(a: Ipa, b: Ipa, rules_name: str = "liapp") -> dict:
     secret_still = [x for x in still if not x["public"]]
     if secret_still:
         conclusions.append(f"알려진 형식의 비공개 키·토큰 {len(secret_still)}개가 적용본에도 그대로 있다.")
+    hard = {rel: e["hardening"] for rel, e in d["binaries"].items() if "hardening" in e}
+    if hard:
+        conclusions.append(
+            f"하드닝 플래그가 바뀐 바이너리 {len(hard)}개: "
+            + ", ".join(f"{rel}({', '.join(f'{k} {v[0]}→{v[1]}' for k, v in h.items())})" for rel, h in hard.items())
+        )
     if ents:
         conclusions.append(f"엔타이틀먼트가 바뀐 번들 {len(ents)}개: " + ", ".join(f"{k}({', '.join(v)})" for k, v in ents.items()))
     conclusions += [f"주의: {w}" for w in d["warnings"]]

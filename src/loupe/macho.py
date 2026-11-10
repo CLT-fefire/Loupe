@@ -17,6 +17,21 @@ CPU_ARM64 = 0x0100000C
 # 이름(식별자)이 들어 있는 섹션. 난독화 비교의 대상.
 NAME_SECTIONS = ("__objc_classname", "__objc_methname", "__swift5_reflstr")
 
+# 하드닝 판정 (mach-o/loader.h 의 헤더 플래그, 가져다 쓰는 심볼)
+MH_PIE = 0x200000
+MH_ALLOW_STACK_EXECUTION = 0x20000
+STACK_CHK = {"___stack_chk_fail", "___stack_chk_guard"}
+ARC_RELEASE = {"_objc_release", "_swift_release"}
+STRIPPED_MAX_LOCAL = 16  # 심볼을 제거한 빌드도 몇 개(헤더 심볼 등)는 남는다
+HARDENING_ISSUES = {
+    "pie": "PIE 아님: 실행 파일이 고정 주소에 올라가 ASLR 이 약해진다",
+    "stack_canary": "스택 카나리 흔적 없음(___stack_chk_* 를 쓰지 않는다): -fstack-protector 없이 빌드됐거나, "
+    "보호할 스택 버퍼가 있는 함수가 하나도 없다(작은 Swift·C 라이브러리)",
+    "arc": "ARC 흔적 없음: ObjC·Swift 를 쓰는데 objc_release·swift_release 를 쓰지 않는다(수동 메모리 관리로 보인다)",
+    "nx_stack": "스택 실행 허용(MH_ALLOW_STACK_EXECUTION)",
+    "stripped": "심볼 미제거: 로컬 심볼이 남아 함수 이름이 보인다",
+}
+
 
 @dataclass
 class Section:
@@ -109,7 +124,30 @@ class MachO:
             },
             "has_code_signature": b.has_code_signature,
             "min_os": _min_os(b),
+            "hardening": self.hardening(),
         }
+
+    def hardening(self) -> dict:
+        """바이너리 하드닝 플래그. 값이 None 이면 이 바이너리에는 해당하지 않는다(dylib 의 PIE, ObjC·Swift 를
+        쓰지 않는 C 라이브러리의 ARC). issues 는 False 인 항목의 설명이다."""
+        b = self.binary
+        flags = b.header.flags
+        is_exec = b.header.file_type == lief.MachO.Header.FILE_TYPE.EXECUTE
+        imported = {s.name for s in b.imported_symbols}
+        uses_objc = any(n.startswith("_objc_") for n in imported)
+        uses_swift = any(n.startswith("_swift_") for n in imported)
+        local = sum(1 for s in b.symbols if str(s.category).endswith("LOCAL"))
+        h = {
+            # dylib·번들은 원래 위치 독립이라 MH_PIE 가 없다
+            "pie": bool(flags & MH_PIE) if is_exec else None,
+            "stack_canary": bool(imported & STACK_CHK),
+            "arc": bool(imported & ARC_RELEASE) if (uses_objc or uses_swift) else None,
+            "nx_stack": not flags & MH_ALLOW_STACK_EXECUTION,
+            "encrypted": bool(b.has_encryption_info and b.encryption_info.crypt_id),
+            "stripped": local <= STRIPPED_MAX_LOCAL,
+        }
+        h["issues"] = [msg for key, msg in HARDENING_ISSUES.items() if h[key] is False]
+        return h
 
 
 def _min_os(b: lief.MachO.Binary) -> str | None:

@@ -118,7 +118,10 @@ def ipa_list() -> dict[str, Any]:
 @_audit
 def ipa_info(id: str) -> dict[str, Any]:
     """번들 정보, 서명·프로파일 종류(ad-hoc/development/…), 빌드 종류 추정, 메인 바이너리 요약
-    (암호화·연결 라이브러리·심볼 수), 앱 안의 바이너리 목록을 보여 준다."""
+    (암호화·연결 라이브러리·심볼 수·하드닝), 앱 안의 바이너리 목록을 보여 준다.
+
+    하드닝: PIE·스택 카나리·ARC·스택 실행 금지·심볼 제거. None 은 해당 없음(dylib 의 PIE 등).
+    바이너리 목록에는 문제가 있는 것만 hardening_issues 로 붙는다."""
     return analysis.info(store.get(id))
 
 

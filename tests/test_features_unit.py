@@ -635,3 +635,48 @@ def test_source_literals_skip_build_products_and_frameworks(tmp_path):
     (vend / "X.h").write_text(f'#define X_API_KEY @"{PW}"\n')
     (tmp_path / "A.m").write_text(f'#define MY_API_KEY @"{PW}"\n')
     assert [c["name"] for c in secret_scan.source_literals(tmp_path)] == ["MY_API_KEY"]
+
+
+# ── 하드닝 ─────────────────────────────────────────────────────────────
+
+from types import SimpleNamespace  # noqa: E402
+
+import lief  # noqa: E402
+
+from loupe import macho  # noqa: E402
+
+EXECUTE, DYLIB = lief.MachO.Header.FILE_TYPE.EXECUTE, lief.MachO.Header.FILE_TYPE.DYLIB
+LOCAL = SimpleNamespace(category="CATEGORY.LOCAL")
+
+
+def _hard(file_type=EXECUTE, flags=macho.MH_PIE, imports=(), local=0, cryptid=0):
+    b = SimpleNamespace(
+        header=SimpleNamespace(flags=flags, file_type=file_type),
+        imported_symbols=[SimpleNamespace(name=n) for n in imports],
+        symbols=[LOCAL] * local,
+        has_encryption_info=True,
+        encryption_info=SimpleNamespace(crypt_id=cryptid),
+    )
+    return MachO(path=None, data=b"", slice_offset=0, slice_size=0, binary=b).hardening()
+
+
+def test_hardening_clean_executable():
+    h = _hard(imports=("___stack_chk_fail", "_objc_msgSend", "_objc_release"))
+    assert h == {"pie": True, "stack_canary": True, "arc": True, "nx_stack": True,
+                 "encrypted": False, "stripped": True, "issues": []}
+
+
+def test_hardening_reports_each_missing_flag():
+    h = _hard(flags=macho.MH_ALLOW_STACK_EXECUTION, imports=("_objc_msgSend",), local=100, cryptid=1)
+    assert (h["pie"], h["stack_canary"], h["arc"], h["nx_stack"], h["stripped"], h["encrypted"]) == (
+        False, False, False, False, False, True)
+    assert len(h["issues"]) == 5 and h["issues"][0].startswith("PIE 아님")
+
+
+def test_hardening_not_applicable_for_dylib_pie_and_c_library_arc():
+    h = _hard(file_type=DYLIB, flags=0, imports=("___stack_chk_guard", "_malloc"))
+    assert h["pie"] is None and h["arc"] is None and h["issues"] == []
+
+
+def test_hardening_swift_only_arc():
+    assert _hard(imports=("_swift_retain", "_swift_release", "___stack_chk_fail"))["arc"] is True

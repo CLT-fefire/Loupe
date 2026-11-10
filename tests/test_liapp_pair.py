@@ -185,3 +185,15 @@ def test_source_secrets_finds_known_hardcoded_values(pair):
     assert {"AES256DecryptWithKey", "TRANSLATE_FLITO_API_KEY", "certPassword"} <= names
     inline = [e for e in r["found"] if any(w["how"] == "swift_inline" for w in e["in_ipa"])]
     assert inline and inline[0]["length"] == 8
+
+
+def test_hardening_real_pair(pair):
+    """2026-11-10 실측: 메인 바이너리는 전부 통과, LIAPP 적용으로 바뀐 하드닝 플래그는 없다."""
+    a, b = pair
+    i = analysis.info(a)
+    h = i["main_binary"]["hardening"]
+    assert (h["pie"], h["stack_canary"], h["arc"], h["nx_stack"], h["stripped"], h["issues"]) == (
+        True, True, True, True, True, [])
+    flagged = {r["path"] for r in i["binaries"] if "hardening_issues" in r}
+    assert flagged == {f"Frameworks/{n}.framework/{n}" for n in ("FBLPromises", "OpenSSL", "RxSwift")}
+    assert not any("hardening" in e for e in analysis.diff(a, b, samples=1)["binaries"].values())

@@ -31,9 +31,9 @@ claude mcp add --scope user loupe -- /Users/Shared/Source/Company/Loupe/.venv/bi
 |:--|:--|
 | `ipa_open(path)` | ipa를 풀어 캐시에 넣고 id를 돌려준다. 같은 ipa(sha256)는 다시 풀지 않는다 |
 | `ipa_list()` / `ipa_clear(id)` | 캐시 목록과 ipa 별 크기(압축 해제본·Ghidra 프로젝트, 분석된 바이너리) 보기 / 지우기 |
-| `ipa_info(id)` | 번들 정보, 프로파일 종류, 빌드 종류 추정, 메인 바이너리 요약 |
+| `ipa_info(id)` | 번들 정보, 프로파일 종류, 빌드 종류 추정, 메인 바이너리 요약, 하드닝(PIE·스택 카나리·ARC·스택 실행 금지·심볼 제거) |
 | `protection_check(id, rules)` | 보호 적용 판정(`applied` / `partial` / `not_applied` / `unknown`)과 근거. ObjC 클래스 이름 섹션이 없으면 `unknown` |
-| `ipa_diff(a, b)` | 파일·섹션·이름·엔타이틀먼트·서명 차이 |
+| `ipa_diff(a, b)` | 파일·섹션·이름·하드닝·엔타이틀먼트·서명 차이 |
 | `pair_report(a, b, rules)` | 미적용(a)·적용(b) 쌍 요약: 판정, 추가 파일, 코드 변경 여부, 바뀐 이름 수, 적용본에도 남은 키·토큰, 엔타이틀먼트. 공유용 `markdown` 포함(키 원문 없음) |
 | `find_strings(ids, query\|regex\|source_ref, scope)` | 문자열 위치와 건수. `source_ref="경로:줄"`이면 그 줄의 리터럴을 찾는다. 15바이트 이하는 `(Swift 인라인)` 줄에 따로 준다 |
 | `secret_scan(id, scope, reveal)` | 형식이 알려진 키·토큰(AWS·Google·Slack·GitHub·Stripe 키, PEM 개인 키, JWT, URL 계정, plist 항목) |
@@ -65,6 +65,13 @@ claude mcp add --scope user loupe -- /Users/Shared/Source/Company/Loupe/.venv/bi
 - `secret_scan` 은 `rules/secret_patterns.yaml` 의 형식으로 찾는다. 바이너리 plist 는 XML 로 바꿔서 보고(위치 offset 은 없다), 미디어·폰트와 64MB 넘는 리소스는 건너뛴다.
 - `source_secrets` 는 소스(`.m .h .mm .swift .c .cpp`, 따옴표 없는 `.xcconfig` 값 포함. 빌드 산출물·`*.framework` 폴더는 뺀다)에서 비밀 키워드(key·secret·password·token·salt·credential·auth)가 든 이름 바로 뒤의 리터럴을 모은다(`let password = …`, `let apiKey: String = …`, `#define X_KEY @"…"`, `certPassword: "…"`). 이스케이프는 `find_strings` 와 같이 푼다. 그 값이 ipa 에 들어 있는지 바이너리(바이트·UTF-16·Swift 인라인)와 리소스(바이트·UTF-16, Info.plist 같은 plist 의 문자열 값)에서 확인한다. 심볼릭 링크 파일은 열지 않는다. 문장·경로·URL·색상·이름 모양은 버리고, 문자 종류와 길이로 신뢰도(high·medium·low)를 매긴다. 2026-11-10 실측에서 `Lysn_Epic` 전체 기준 후보 33건 중 ipa 에 들어간 5건이 모두 실제 하드코딩 값이었다(오탐 0, 3.8초). 파일은 한 번씩만 읽어 값마다 찾고, 서로 다른 후보가 500개를 넘으면 나머지는 확인하지 않고 알린다(`root` 를 좁힌다).
 - 두 도구 모두 값을 가린다(16자 이상이면 앞 4자·뒤 2자, 짧으면 길이만). 같은 값인지는 `fingerprint` 로 본다. 지문은 이 Mac 의 캐시 폴더에만 있는 키(`fingerprint.key`, 권한 0600)로 만든 HMAC 이다. 원문은 `reveal=true` 일 때만 주고, 감사 로그에 `reveal` 여부를 남긴다. `find_strings`·`list_names`·`decompile` 은 찾은 값을 원문으로 주므로, 외부로 옮길 때는 사람이 가린다.
+
+**하드닝(`ipa_info`·`ipa_diff`)**: Mach-O 헤더 플래그와 가져다 쓰는 심볼로 본다(`macho.py`).
+- PIE 는 헤더의 `MH_PIE`(실행 파일만, dylib 는 해당 없음), 스택 실행 금지는 `MH_ALLOW_STACK_EXECUTION` 이 없는 것이다.
+- 스택 카나리는 `___stack_chk_fail`·`___stack_chk_guard`, ARC 는 `_objc_release`·`_swift_release` 를 쓰는지로 본다. ObjC·Swift 를 쓰지 않는 C 라이브러리는 ARC 해당 없음이다.
+- 카나리·ARC 는 바이너리 단위의 흔적이다. 일부 오브젝트만 보호됐거나 MRC 코드가 ARC·Swift 코드와 섞였으면 통과로 나온다. 반대로 보호할 스택 버퍼가 없는 작은 라이브러리는 카나리 없음으로 나온다. MobSF 도 같은 방식이다.
+- 심볼 제거는 로컬 심볼이 16개 이하인지로 본다. 서드파티 dylib 은 대개 제거되지 않아 `hardening_issues` 에 뜬다.
+- `ipa_diff` 는 바뀐 바이너리에서 값이 달라진 플래그만 `[a, b]` 로 주고, `pair_report` 는 결론에 한 줄로 적는다.
 
 **함수 짝짓기(`compare_function`)**: b 에서 짝은 이 순서로 찾는다(`matching.py`).
 1. 전체 이름이, 안 되면 `::` 뒤 메서드 이름이 a·b 양쪽에서 하나뿐이면 그것으로 짝짓는다. `FUN_…`·`_OUTLINED_FUNCTION_N` 같은 생성 이름은 쓰지 않는다.
