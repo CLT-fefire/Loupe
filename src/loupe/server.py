@@ -23,9 +23,10 @@ Loupe — 우리가 직접 빌드한 ipa 를 정적으로 분석한다(보호 �
 - 문자열: find_strings(ids, query|regex|source_ref). 15바이트 이하는 Swift 가 명령어 즉값으로 넣으므로
   '(Swift 인라인)' 줄에서 명령어 패턴으로 따로 찾는다. 찾은 address 는 decompile 로 확인한다.
 - 이름: list_names(id, other_id?) 로 난독화된/보존된 클래스·메서드 이름을 본다.
-- 키·토큰: secret_scan(id). 알려진 형식만 찾고 값은 가린다(reveal=true 로 원문).
+- 키·토큰: secret_scan(id) 는 알려진 형식(AWS·Google 키, JWT 등). 형식 없는 비밀번호·키는
+  source_secrets(id, root) 로 소스의 후보가 ipa 에 들어갔는지 본다. 둘 다 값은 가린다(reveal=true 로 원문).
 - 쌍 요약: pair_report(a, b). 판정·코드 변경·이름·남은 키·엔타이틀먼트를 한 번에, 공유용 markdown 포함.
-- Ghidra: ghidra_analyze 로 시작(26MB 바이너리는 약 10분, ghidra_status 가 예상 시간을 준다) → search_functions /
+- Ghidra: ghidra_analyze 로 시작(26MB 바이너리는 약 9분, profile=fast 면 약 7분. ghidra_status 가 예상 시간을 준다) → search_functions /
   decompile / xrefs. 같은 함수를 두 ipa 에서 비교하려면 compare_function(a, b, function).
 
 find_strings·list_names·decompile 등은 찾은 값을 원문으로 돌려준다. 외부(Confluence·메일 등)로 옮길 때
@@ -52,7 +53,7 @@ def _audit(fn):
     def wrapper(*args, **kwargs):
         t = time.time()
         # reveal 은 원문 열람 여부를 남기려고 기록한다(값은 남기지 않는다)
-        ids = {k: v for k, v in kwargs.items() if k in ("id", "a", "b", "ids", "other_id", "reveal")}
+        ids = {k: v for k, v in kwargs.items() if k in ("id", "a", "b", "ids", "other_id", "reveal", "root")}
         try:
             out = fn(*args, **kwargs)
             _log.info("%s ok ids=%s bytes=%d %.1fs", fn.__name__, ids, len(json.dumps(out, default=str)), time.time() - t)
@@ -71,6 +72,14 @@ def _audit(fn):
 READ = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False)
 CACHE_WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 DELETE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False)
+
+
+def _profile_of(key: str) -> str:
+    ipa_id, rel = key.split("/", 1)
+    try:
+        return json.loads(config.ghidra_marker(ipa_id, rel).read_text()).get("profile", "full")
+    except (OSError, ValueError):
+        return "full"
 
 
 def _key(ipa: store.Ipa, binary: str | None) -> tuple[str, str]:
@@ -186,6 +195,18 @@ def secret_scan(id: str, scope: str = "all", reveal: bool = False) -> dict[str, 
 
 @mcp.tool(annotations=READ)
 @_audit
+def source_secrets(id: str, root: str, reveal: bool = False, include_absent: bool = False) -> dict[str, Any]:
+    """소스에서 비밀값 모양의 리터럴(키·비밀번호·토큰 이름 바로 뒤)을 찾아, ipa 에 실제로 들어갔는지 확인한다.
+
+    형식이 정해진 키(secret_scan)가 아닌 임의 문자열 비밀번호·키를 찾는 용도다. root: 소스 폴더
+    (절대 경로 또는 LOUPE_SOURCE_ROOTS 기준 상대 경로. 루트 밖은 거부한다). 결과 found 는 신뢰도(high·medium·low)
+    순이고 값은 가린다(reveal=true 로 원문). include_absent=true 면 ipa 에 없는 후보도 보여 준다.
+    """
+    return analysis.source_secrets(store.get(id), root, bool(reveal), bool(include_absent))
+
+
+@mcp.tool(annotations=READ)
+@_audit
 def pair_report(a: str, b: str, rules: str = "liapp") -> dict[str, Any]:
     """미적용(a)·적용(b) 쌍 점검을 한 번에 요약한다: 양쪽 판정, 추가 파일, 코드(__text) 변경 여부,
     바뀐 이름 수, 적용본에도 그대로 보이는 키·토큰(값은 가림), 엔타이틀먼트·서명 차이, 경고.
@@ -209,14 +230,18 @@ def ipa_clear(id: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=CACHE_WRITE)
 @_audit
-def ghidra_analyze(id: str, binary: str = "main") -> dict[str, Any]:
-    """Ghidra 분석을 백그라운드로 시작한다. 이미 분석된 바이너리는 바로 done 이다.
+def ghidra_analyze(id: str, binary: str = "main", profile: str = "full") -> dict[str, Any]:
+    """Ghidra 분석을 백그라운드로 시작한다. 이미 분석된 바이너리는 바로 done 이다(그때 쓴 profile 을 준다).
 
     binary: main(기본) | 앱 기준 상대 경로(예: Frameworks/RxSwift.framework/RxSwift) | 파일 이름.
-    큰 바이너리는 수십 분 걸린다. ghidra_status 로 확인한다.
+    profile: full(기본, 26MB 약 9분) | fast(약 20% 빠름. 함수·명령어·xrefs 는 같고, 스택 변수와
+    호출 규약 정보가 빠져 디컴파일에 'Unknown calling convention' 경고가 붙는다). ghidra_status 로 확인한다.
+    두 ipa 를 compare_function 으로 비교할 때는 같은 profile 로 분석한다.
     """
+    if profile not in config.GHIDRA_PROFILES:
+        raise LoupeError(f"profile 은 {list(config.GHIDRA_PROFILES)} 중 하나다")
     key, path = _key(store.get(id), binary)
-    return ghidra_client.call("analyze", key=key, path=path)
+    return ghidra_client.call("analyze", key=key, path=path, profile=profile)
 
 
 @mcp.tool(annotations=READ)
@@ -273,8 +298,9 @@ def compare_function(a: str, b: str, function: str, binary: str = "main", max_ch
 
     function 은 a 에서의 이름이나 주소(0x…). b 에서 짝은 이 순서로 찾는다(matched_by):
     name / method_name(전체 이름, 안 되면 :: 뒤 메서드 이름이 양쪽에서 하나뿐) → address(같은 주소·같은 서명.
-    서명이 같은 형제 함수가 여럿이면 묶음 순서까지 맞을 때만) → signature(재배치를 무시한 바이트 서명 묶음에서
-    a 와 같은 순서) → address(같은 주소, 코드는 다르거나 확정 못 함 — notes 에 이유).
+    서명이 같은 형제 함수가 여럿이면 확인 후) → signature(재배치를 무시한 바이트 서명. 여럿이면 호출 대상까지
+    넣은 서명, 그래도 같으면 묶음 순서) → address(같은 주소, 코드는 다르거나 확정 못 함 — notes 에 이유).
+    두 ipa 의 분석 프로필이 다르면 notes 맨 앞에 알린다.
     결과: identical(완전히 같음), names_only(로직은 같고 이름만 바뀜), renamed(바뀐 이름 짝), diff(그 밖의 차이).
     """
     max_chars = analysis.clamp("max_chars", max_chars, 100, 100_000)
@@ -294,6 +320,13 @@ def compare_function(a: str, b: str, function: str, binary: str = "main", max_ch
     )
     cmp = analysis.compare_code(ra["code"], rb["code"])
     notes = list(m["notes"])
+    pa, pb = _profile_of(ka), _profile_of(kb)
+    if pa != pb:
+        notes.insert(
+            0,
+            f"a 는 {pa}, b 는 {pb} 프로필로 분석됐다. 디컴파일 차이(호출 규약 경고 등)는 분석 설정 때문일 수 있다. "
+            "같은 프로필로 다시 분석하려면 ipa_clear 후 다시 연다",
+        )
     if m["function"]["entry"] != fa["entry"]:
         notes.append(f"주소가 달라 {m['method']} 로 짝지었다: a 0x{fa['entry']} → b 0x{m['function']['entry']}")
     if rb["function"]["size"] != fa["size"]:

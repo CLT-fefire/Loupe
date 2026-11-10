@@ -9,7 +9,8 @@ Ghidra 없이 단위 테스트할 수 있다. 서명은 필요할 때만 계산�
   ② address     같은 주소에서 시작하는 함수의 서명이 a 와 같다. 단 a 에 서명이 같은 함수가 여럿이면
                 (분기 대상만 다른 thunk 묶음) 배치가 밀려 형제 함수가 그 자리에 왔을 수 있으므로,
                 묶음 개수와 순서까지 맞을 때만 확정하고 아니면 ③ 의 결과를 따른다
-  ③ signature   크기·서명이 같은 함수 묶음이 a·b 에서 같은 개수다 → a 묶음 안 순서와 같은 것
+  ③ signature   크기·서명이 같은 함수 중 a 의 함수와 짝 — 묶음이 여럿이면 호출 대상까지 넣은 서명으로
+                구분하고, 그래도 안 되면 묶음 개수가 a·b 같을 때 a 묶음 안 순서와 같은 것
   ④ address     같은 주소에서 시작하는 함수(코드는 다르다)
 이름 단계는 주소·순번에서 나온 이름(FUN_…, _OUTLINED_FUNCTION_N)을 쓰지 않는다.
 """
@@ -17,10 +18,13 @@ Ghidra 없이 단위 테스트할 수 있다. 서명은 필요할 때만 계산�
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-MAX_CANDIDATES = 3000  # 크기가 같은 후보가 이보다 많으면 서명 비교를 하지 않는다
+MAX_CANDIDATES = 20_000  # 크기가 같은 후보가 이보다 많으면 서명 비교를 하지 않는다
+SIGNATURE_BUDGET_S = 60.0  # 서명 계산이 이 시간을 넘으면 그만둔다(서명은 캐시되므로 다시 부르면 이어서 빨라진다)
+DEEP_MAX = 200  # 서명 묶음이 이보다 크면 호출 대상 비교를 하지 않는다(묶음 순서로만 구분)
 _GENERATED_NAME = re.compile(r"(?:thunk_)?(?:FUN|SUB|LAB)_[0-9a-fA-F]+|_?OUTLINED_FUNCTION_\d+")
 
 
@@ -42,6 +46,8 @@ class Index(Protocol):
 class Side:
     idx: Index
     sig: Callable[[str], str]  # 시작 주소 -> 서명
+    # 시작 주소 -> 호출 대상까지 넣은 서명. 분기 대상만 다른 함수(thunk 묶음)를 구분한다. 없으면 순서로만 구분
+    deep: Callable[[str], str] | None = None
 
 
 def short_name(name: str) -> str:
@@ -60,11 +66,18 @@ def _entry_key(entry: str) -> int:
 
 
 def same_signature(side: Side, size: int, signature: str) -> list | None:
-    """크기·서명이 같은 코드 함수(주소 순). 후보가 너무 많으면 None."""
+    """크기·서명이 같은 코드 함수(주소 순). 후보가 너무 많거나 시간 예산을 넘으면 None."""
     cands = [r for r in side.idx.rows if r.is_code and r.size == size]
     if len(cands) > MAX_CANDIDATES:
         return None
-    return sorted((r for r in cands if side.sig(r.entry) == signature), key=lambda r: _entry_key(r.entry))
+    deadline = time.monotonic() + SIGNATURE_BUDGET_S
+    hits = []
+    for r in cands:
+        if side.sig(r.entry) == signature:
+            hits.append(r)
+        if time.monotonic() > deadline:
+            return None
+    return sorted(hits, key=lambda r: _entry_key(r.entry))
 
 
 def _unique(idx: Index, name: str, field: str) -> list:
@@ -104,19 +117,31 @@ def choose(a: Side, b: Side, entry: str, name: str, size: int, b_has_entry: bool
 
     hits = same_signature(b, size, sig) if group_a is not None else None
     if group_a is None or hits is None:
-        notes.append(f"크기가 같은 함수가 {MAX_CANDIDATES:,}개를 넘어 서명으로 찾지 않았다")
+        notes.append(
+            f"크기가 같은 함수가 {MAX_CANDIDATES:,}개를 넘었거나 서명 계산이 {SIGNATURE_BUDGET_S:.0f}초를 넘어 서명으로 찾지 않았다"
+        )
     elif rank is None:
         notes.append("a 의 함수가 코드 블록 밖에 있어 서명 묶음으로 짝짓지 않았다")
-    elif hits and len(hits) == len(group_a):
-        b_entry = hits[rank].entry
-        if same_at_entry and b_entry == entry:
-            return {"method": "address", "entry": entry, "notes": notes}
-        if len(hits) > 1:
-            notes.append(f"크기·서명이 같은 함수 {len(hits)}개 중 a 와 같은 순서({rank + 1}번째)의 것을 골랐다")
-        if same_at_entry:
-            notes.append("같은 주소에도 서명이 같은 함수가 있지만, 묶음 순서가 달라 배치가 밀린 것으로 보았다")
-        return {"method": "signature", "entry": b_entry, "notes": notes}
     elif hits:
+        # 묶음이 여럿이면 호출 대상까지 넣은 서명으로 먼저 구분한다(배치·개수가 달라도 된다)
+        if (len(group_a) > 1 or len(hits) > 1) and a.deep and b.deep and max(len(group_a), len(hits)) <= DEEP_MAX:
+            d = a.deep(entry)
+            da = [r for r in group_a if a.deep(r.entry) == d]
+            db = [r for r in hits if b.deep(r.entry) == d]
+            if len(da) == 1 and len(db) == 1:
+                if same_at_entry and db[0].entry == entry:
+                    return {"method": "address", "entry": entry, "notes": notes}
+                notes.append(f"크기·서명이 같은 함수가 a {len(group_a)}개, b {len(hits)}개라 호출 대상까지 비교해 구분했다")
+                return {"method": "signature", "entry": db[0].entry, "notes": notes}
+        if len(hits) == len(group_a):
+            b_entry = hits[rank].entry
+            if same_at_entry and b_entry == entry:
+                return {"method": "address", "entry": entry, "notes": notes}
+            if len(hits) > 1:
+                notes.append(f"크기·서명이 같은 함수 {len(hits)}개 중 a 와 같은 순서({rank + 1}번째)의 것을 골랐다")
+            if same_at_entry:
+                notes.append("같은 주소에도 서명이 같은 함수가 있지만, 묶음 순서가 달라 배치가 밀린 것으로 보았다")
+            return {"method": "signature", "entry": b_entry, "notes": notes}
         notes.append(f"크기·서명이 같은 함수가 a {len(group_a)}개, b {len(hits)}개라 서명으로 짝짓지 않았다")
 
     if same_at_entry:

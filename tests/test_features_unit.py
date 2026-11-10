@@ -1,5 +1,6 @@
 """Swift 인라인 문자열 찾기, 시크릿 스캔(실제 바이너리 없이)."""
 
+import os
 import plistlib
 import struct
 import zipfile
@@ -436,3 +437,201 @@ def test_choose_non_code_function_does_not_crash():
     b = side([("FUN_2000", "2000", 8)], {"2000": "s"})
     r = matching.choose(a, b, "1000", "FUN_1000", 8, False)
     assert r["method"] is None and "코드 블록 밖" in r["notes"][0]
+
+
+# ── 호출 대상까지 넣은 서명(묶음 구분) ───────────────────────────────────
+
+
+def test_call_targets_bl_and_tail_branch():
+    b_insn = lambda off: 0x14000000 | (off & 0x03FFFFFF)  # noqa: E731
+    code = text_of(bl(4), b_insn(1), bl(-2 & 0x03FFFFFF), b_insn(100))
+    # BL +4 → 0x1010, B +1(함수 안) 제외, BL -2 → 0x1000, B +100 → 0x1000+12+400
+    assert arm64.call_targets(code, 0x1000) == [0x1010, 0x1000, 0x1000 + 12 + 400]
+
+
+def deep_side(rows, sigs, deeps):
+    s = side(rows, sigs)
+    s.deep = lambda e: deeps.get(e, "")
+    return s
+
+
+def test_choose_deep_signature_when_group_sizes_differ():
+    """b 에서 thunk 하나가 빠져 묶음 개수가 달라도, 호출 대상이 다르면 짝을 찾는다."""
+    ea = ["1000", "1080", "1100", "1180"]
+    eb = ["2000", "2080", "2100"]  # a 의 1000 에 해당하는 것이 빠졌다
+    a = deep_side([(f"FUN_{e}", e, 8) for e in ea], {e: "s" for e in ea}, {e: f"s|impl{k}" for k, e in enumerate(ea)})
+    b = deep_side([(f"FUN_{e}", e, 8) for e in eb], {e: "s" for e in eb}, {e: f"s|impl{k + 1}" for k, e in enumerate(eb)})
+    r = matching.choose(a, b, "1100", "FUN_1100", 8, False)  # impl2
+    assert (r["method"], r["entry"]) == ("signature", "2080")
+    assert "호출 대상" in r["notes"][0]
+
+
+def test_choose_deep_signature_confirms_same_address():
+    ea = ["1000", "1080"]
+    a = deep_side([(f"FUN_{e}", e, 8) for e in ea], {e: "s" for e in ea}, {"1000": "s|x", "1080": "s|y"})
+    b = deep_side([(f"FUN_{e}", e, 8) for e in ea], {e: "s" for e in ea}, {"1000": "s|x", "1080": "s|y"})
+    r = matching.choose(a, b, "1080", "FUN_1080", 8, True)
+    assert r == {"method": "address", "entry": "1080", "notes": []}
+
+
+def test_choose_deep_tie_falls_back_to_rank():
+    ea = ["1000", "1080"]
+    a = deep_side([(f"FUN_{e}", e, 8) for e in ea], {e: "s" for e in ea}, {e: "s|same" for e in ea})
+    b = deep_side([(f"FUN_{e}", e, 8) for e in ["2000", "2080"]], {"2000": "s", "2080": "s"}, {"2000": "s|same", "2080": "s|same"})
+    r = matching.choose(a, b, "1080", "FUN_1080", 8, False)
+    assert (r["method"], r["entry"]) == ("signature", "2080") and "순서" in r["notes"][0]
+
+
+# ── source_secrets ──────────────────────────────────────────────────────
+
+PW = "dQ7" + "#k&(" + "x^Lm" + "Z9pR" + "SG"  # 실제 값이 아닌 비밀번호 모양(실행 중 조립)
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("Network error occurred", None),  # 문장
+        ("/api/v1/signin", None),  # 경로
+        ("0xff0000", None),  # 색상
+        ("x-api-key", None),  # 문자로만 된 이름
+        ("doNotShow24Hours", None),  # 단어 위주 이름
+        ("1A2B3C4D-1111-2222-3333-444455556666", "low"),  # UUID
+        (PW, "high"),
+        ("abc12345", "medium"),
+    ],
+)
+def test_source_confidence(value, expected):
+    assert secret_scan.source_confidence(value) == expected
+
+
+def test_source_literals_skip_key_name_apis_and_comments(tmp_path):
+    (tmp_path / "A.m").write_text(
+        "\n".join(
+            [
+                f'#define MY_API_KEY @"{PW}"',
+                f'id x = [dict objectForKey:@"{PW}"];',  # 키 이름을 다루는 API
+                f'userInfo:@{{NSLocalizedDescriptionKey: @"{PW}"}}',  # 오류 메시지 키
+                f'// let password = "{PW}"',  # 주석
+                f'return [data AES256DecryptWithKey:@"{PW}"];',
+            ]
+        )
+    )
+    (tmp_path / "B.swift").write_text('let c = load(certPassword: "abc12345")\n')
+    (tmp_path / "skip.txt").write_text(f'apiKey = "{PW}"\n')
+    got = {(os.path.basename(c["path"]), c["line"], c["name"]) for c in secret_scan.source_literals(tmp_path)}
+    assert got == {("A.m", 1, "MY_API_KEY"), ("A.m", 5, "AES256DecryptWithKey"), ("B.swift", 1, "certPassword")}
+
+
+def test_source_secrets_reports_only_values_in_ipa(sandbox, monkeypatch):
+    src = sandbox / "src"
+    src.mkdir()
+    (src / "A.m").write_text(f'#define MY_API_KEY @"{PW}"\n#define OLD_KEY @"zz{PW}"\n')
+    (src / "B.swift").write_text('let c = load(certPassword: "abc12345")\n')
+    monkeypatch.setattr(config, "SOURCE_ROOTS", [sandbox.resolve()])
+    w0, w1 = swift_small.words("abc12345")
+    main = b"\xcf\xfa\xed\xfe" + b"\0" * 28 + b"\0" + PW.encode() + b"\0"
+    ipa = _ipa(sandbox, "src.ipa", {})
+    (ipa.app / "A").write_bytes(main)  # 메인 바이너리에 PW 만 넣는다
+    r = analysis.source_secrets(ipa, str(src), include_absent=True)
+    assert [(e["sources"][0]["name"], e["confidence"], e["in_ipa"][0]["how"]) for e in r["found"]] == [("MY_API_KEY", "high", "bytes")]
+    assert r["absent_count"] == 2 and PW not in str(r)
+    with pytest.raises(store.LoupeError, match="소스 루트 밖"):
+        analysis.source_secrets(ipa, "/usr")
+
+
+# ── 리뷰 지적 회귀(7차, 2026-11-10) ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "line, name",
+    [
+        (f'let password = "{PW}"', "password"),
+        (f'NSString *secret = @"{PW}";', "secret"),
+        (f'static let token: String = "{PW}"', "token"),
+        (f'let apiKey: String = "{PW}"', "apiKey"),
+        (f'private let clientSecret: String? = "{PW}"', "clientSecret"),
+        (f'let salt = "{PW}"', "salt"),
+    ],
+)
+def test_source_literals_common_declarations(tmp_path, line, name):
+    (tmp_path / "A.swift").write_text(line + "\n")
+    assert [c["name"] for c in secret_scan.source_literals(tmp_path)] == [name]
+
+
+def test_source_literals_unescape_like_find_strings(tmp_path):
+    (tmp_path / "A.swift").write_text('let authToken = "Zx9\\tQw7#Lm\\u{AC00}"\n')
+    [c] = secret_scan.source_literals(tmp_path)
+    assert c["value"] == "Zx9\tQw7#Lm가"
+
+
+def test_source_literals_skip_symlinked_files(tmp_path, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("out") / "Leak.swift"
+    outside.write_text(f'let password = "{PW}"\n')
+    (tmp_path / "Leak.swift").symlink_to(outside)
+    assert secret_scan.source_literals(tmp_path) == []
+
+
+def test_presence_finds_value_in_info_plist(sandbox):
+    """xcconfig 값은 Info.plist 로 들어간다. XML plist 에서 '&' 는 '&amp;' 로 저장돼 바이트로는 안 맞으므로
+    plist 를 읽어 값으로 비교한다. 바이너리 plist 는 바이트 그대로라 바이트 검색에 걸린다."""
+    val = "Ab3&" + "Zq9#" + "Lm7!"
+    files = {
+        "Info2.plist": plistlib.dumps({"APIKey": val}, fmt=plistlib.FMT_XML),
+        "Info3.plist": plistlib.dumps({"APIKey": val}, fmt=plistlib.FMT_BINARY),
+    }
+    ipa = _ipa(sandbox, "pl.ipa", files)
+    where = secret_scan.presence(ipa, val)
+    assert [(w["path"], w["how"]) for w in where] == [("Info2.plist", "plist"), ("Info3.plist", "bytes")]
+
+
+def test_choose_deep_when_only_b_has_group():
+    """a 에서는 서명이 유일하고 b 에만 같은 서명이 여럿이어도 호출 대상으로 구분한다."""
+    a = deep_side([("FUN_1000", "1000", 8)], {"1000": "s"}, {"1000": "s|x"})
+    b = deep_side([("FUN_2000", "2000", 8), ("FUN_2080", "2080", 8)], {"2000": "s", "2080": "s"}, {"2000": "s|y", "2080": "s|x"})
+    r = matching.choose(a, b, "1000", "FUN_1000", 8, False)
+    assert (r["method"], r["entry"]) == ("signature", "2080")
+
+
+def test_choose_gives_up_when_signature_budget_exceeded(monkeypatch):
+    monkeypatch.setattr(matching, "SIGNATURE_BUDGET_S", -1.0)
+    a = side([("FUN_1000", "1000", 8)], {"1000": "s"})
+    b = side([("FUN_2000", "2000", 8)], {"2000": "s"})
+    r = matching.choose(a, b, "1000", "FUN_1000", 8, False)
+    assert r["method"] is None and "초를 넘어" in r["notes"][0]
+
+
+# ── 2차 재리뷰 회귀(7차) ────────────────────────────────────────────────
+
+
+def test_source_literals_keep_sdk_setters(tmp_path):
+    """setApiKey: 같은 세터에 넣은 키는 비밀값이다(키 이름 API 인 objectForKey: 와 다르다)."""
+    (tmp_path / "A.m").write_text(f'[Foo setApiKey:@"{PW}"];\n[conn setConsumerKey:@"{PW}x"];\n[d objectForKey:@"{PW}"];\n')
+    assert [c["name"] for c in secret_scan.source_literals(tmp_path)] == ["setApiKey", "setConsumerKey"]
+
+
+def test_source_literals_xcconfig_unquoted(tmp_path):
+    (tmp_path / "Release.xcconfig").write_text(
+        f"API_KEY = {PW} // 운영\nCLIENT_SECRET[sdk=iphoneos*] = \"{PW}y\"\nBUNDLE_ID = com.example.app\nAPI_TOKEN = $(INHERITED_TOKEN)\n"
+    )
+    got = [(c["name"], c["value"]) for c in secret_scan.source_literals(tmp_path)]
+    assert got == [("API_KEY", PW), ("CLIENT_SECRET", PW + "y")]
+
+
+def test_presence_many_single_pass_and_nested_values(sandbox):
+    short, long_ = "Zq9#Lm7!", "Ab3&Zq9#Lm7!Xy"  # 짧은 값이 긴 값 안에 들어 있다
+    ipa = _ipa(sandbox, "pm.ipa", {"conf.txt": f"x{long_}x".encode(), "other.txt": short.encode()})
+    r = secret_scan.presence_many(ipa, [short, long_, "absent-value-1"])
+    assert sorted(w["path"] for w in r[short]) == ["conf.txt", "other.txt"]
+    assert [w["path"] for w in r[long_]] == ["conf.txt"]
+    assert r["absent-value-1"] == []
+
+
+def test_source_literals_skip_build_products_and_frameworks(tmp_path):
+    hdr = tmp_path / "Products" / "Debug" / "OpenSSL.framework" / "Headers"
+    hdr.mkdir(parents=True)
+    (hdr / "obj_mac.h").write_text('#define SN_pbe_WithSHA1And3_Key_TripleDES_CBC "PBE-SHA1-3DES"\n')
+    vend = tmp_path / "Vendor" / "X.framework"
+    vend.mkdir(parents=True)
+    (vend / "X.h").write_text(f'#define X_API_KEY @"{PW}"\n')
+    (tmp_path / "A.m").write_text(f'#define MY_API_KEY @"{PW}"\n')
+    assert [c["name"] for c in secret_scan.source_literals(tmp_path)] == ["MY_API_KEY"]

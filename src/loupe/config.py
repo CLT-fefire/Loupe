@@ -52,3 +52,12 @@ def ghidra_marker(ipa_id: str, rel: str) -> Path:
 def is_under(path: Path, roots: list[Path]) -> bool:
     path = path.resolve()
     return any(path == r or r in path.parents for r in roots)
+
+
+# Ghidra 분석 프로필: 끌 분석기 목록. fast 는 xrefs·이름·함수 경계에 쓰지 않는 것만 끈다.
+# 2026-11-10 실측(26.5MB): full 546초, fast 438초. Decompiler Switch Analysis 는 끄면 case 블록 명령어가
+# 해독되지 않아(명령어 -1.6%) xrefs 가 빠지므로 어떤 프로필에서도 끄지 않는다.
+GHIDRA_PROFILES: dict[str, list[str]] = {"full": [], "fast": ["Stack", "Call Convention ID"]}
+
+# MCP 서버와 워커가 주고받는 요청 형식의 버전. 바꾸면 이미 떠 있는 옛 워커를 내리고 새로 띄운다.
+WORKER_PROTOCOL = 3

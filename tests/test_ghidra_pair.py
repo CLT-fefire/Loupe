@@ -103,3 +103,14 @@ def test_signature_group_of_selector_thunks():
 def test_worker_rejects_bad_key():
     with pytest.raises(Exception, match="잘못된 key"):
         ghidra_client.call("search_functions", key=f"{PLAIN}/../x", pattern=".")
+
+
+def test_deep_signature_splits_thunks_and_matches_across_builds():
+    """thunk 4개는 서명이 같지만 호출 대상까지 넣은 서명으로는 3종으로 갈리고, 두 빌드에서 같다.
+    가운데 둘(networkError·userCancelled)은 부르는 구현까지 쌍둥이라 묶음 순서로만 구분된다."""
+    entries = ("1007148f0", "100714970", "1007149f0", "100714a70")
+    plain = [_sig(PLAIN, f"0x{e}")["deep"] for e in entries]
+    liapp = [_sig(LIAPP, f"0x{e}")["deep"] for e in entries]
+    assert len({p.split("|")[0] for p in plain}) == 1
+    assert len(set(plain)) == 3 and plain[1] == plain[2]
+    assert plain == liapp

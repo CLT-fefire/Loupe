@@ -298,3 +298,129 @@ def test_analyze_rejects_path_outside_ipa_cache(sandbox, tmp_path_factory):
 def test_check_args_checks_other_key():
     with pytest.raises(ValueError, match="other_key"):
         ghidra_worker.check_args({"key": "abc123/A", "other_key": "abc123/../A"})
+
+
+# ── 분석 프로필 ──────────────────────────────────────────────────────────
+
+
+def test_analyze_rejects_unknown_profile(sandbox):
+    ipa = _ipa(sandbox)
+    with pytest.raises(ValueError, match="profile"):
+        ghidra_worker.op_analyze(f"{ipa.id}/A", str(ipa.app / "A"), profile="turbo")
+
+
+def test_cached_analysis_reports_its_profile(sandbox):
+    import json
+
+    ipa = _ipa(sandbox)
+    m = config.ghidra_marker(ipa.id, "A")
+    m.parent.mkdir(parents=True)
+    m.write_text(json.dumps({"program": "A", "rel": "A", "profile": "fast"}))
+    r = ghidra_worker.op_analyze(f"{ipa.id}/A", str(ipa.app / "A"), profile="full")
+    assert (r["state"], r["cached"], r["profile"]) == ("done", True, "fast")
+    assert "ipa_clear" in r["note"]  # 다른 프로필로 다시 분석하는 방법을 알려 준다
+    assert "note" not in ghidra_worker.op_analyze(f"{ipa.id}/A", str(ipa.app / "A"), profile="fast")
+
+
+def test_estimate_uses_same_profile_only(sandbox):
+    import json
+
+    for i, (prof, secs) in enumerate([("full", 2000), ("fast", 1000)]):
+        d = config.CACHE_DIR / f"{i:012x}" / "ghidra" / "A"
+        d.mkdir(parents=True)
+        (d / "analyzed.json").write_text(json.dumps({"seconds": secs, "size": 100_000_000, "profile": prof}))
+    assert ghidra_worker._sec_per_mb("full") == 20.0
+    assert ghidra_worker._sec_per_mb("fast") == 10.0
+
+
+def test_profiles_never_disable_switch_analysis():
+    """Switch Analysis 를 끄면 case 블록 명령어가 해독되지 않아 xrefs 가 빠진다(2026-11-10 실측 -1.6%)."""
+    assert all("Decompiler Switch Analysis" not in v for v in ghidra_worker.PROFILES.values())
+
+
+# ── 옛 워커 교체(프로토콜) ───────────────────────────────────────────────
+
+
+def test_shutdown_refuses_while_busy_and_stops_when_idle(monkeypatch):
+    import threading
+
+    stop = threading.Event()
+    monkeypatch.setattr(ghidra_worker, "_stop", stop)
+    monkeypatch.setattr(ghidra_worker, "_server_ref", [])
+    monkeypatch.setitem(ghidra_worker._jobs, "abc123/A", {"state": "running"})
+    with pytest.raises(RuntimeError, match="진행 중"):
+        ghidra_worker.op_shutdown()
+    assert not stop.is_set()
+    ghidra_worker._jobs.pop("abc123/A")
+    assert ghidra_worker.op_shutdown()["stopping"] is True and stop.is_set()
+
+
+def test_ensure_worker_replaces_old_protocol(no_worker, monkeypatch):
+    calls = []
+    pongs = iter([{"pid": 1, "protocol": config.WORKER_PROTOCOL - 1}, None, {"pid": 2, "protocol": config.WORKER_PROTOCOL}])
+    monkeypatch.setattr(ghidra_client, "_ping", lambda: next(pongs, {"pid": 2, "protocol": config.WORKER_PROTOCOL}))
+    monkeypatch.setattr(ghidra_client, "_retire_old_worker", lambda pong: calls.append(("retire", pong["pid"])))
+    monkeypatch.setattr(ghidra_client, "_spawn", lambda: calls.append(("spawn",)))
+    ghidra_client.ensure_worker()
+    assert calls == [("retire", 1), ("spawn",)]
+
+
+def test_ensure_worker_keeps_current_protocol(no_worker, monkeypatch):
+    monkeypatch.setattr(ghidra_client, "_ping", lambda: {"pid": 2, "protocol": config.WORKER_PROTOCOL})
+    ghidra_client.ensure_worker()  # no_worker 의 _spawn 은 불리면 실패한다
+
+
+def test_pre_protocol_worker_is_not_killed(no_worker, monkeypatch):
+    """shutdown op 를 모르는 옛 워커는 진행 중인 조회를 알 수 없어 강제로 내리지 않고 방법을 알린다."""
+    def fake_request(op, wait, **args):
+        raise store.LoupeError("ValueError: 모르는 op: shutdown")
+
+    monkeypatch.setattr(ghidra_client, "_request", fake_request)
+    monkeypatch.setattr(ghidra_client.os, "kill", lambda pid, sig: pytest.fail("옛 워커를 죽였다"))
+    with pytest.raises(store.LoupeError, match="kill <pid>"):
+        ghidra_client._retire_old_worker({"pid": 4321})
+
+
+def test_newer_worker_is_not_retired(no_worker, monkeypatch):
+    """옛 코드로 떠 있는 MCP 서버가 더 새 워커를 내리지 않는다(내리면 새 코드로 다시 떠 영영 맞지 않는다)."""
+    monkeypatch.setattr(ghidra_client, "_ping", lambda: {"pid": 9, "protocol": config.WORKER_PROTOCOL + 1})
+    monkeypatch.setattr(ghidra_client, "_retire_old_worker", lambda pong: pytest.fail("더 새 워커를 내렸다"))
+    with pytest.raises(store.LoupeError, match="다시 시작"):
+        ghidra_client.ensure_worker()
+
+
+_REAL_SPAWN = ghidra_client._spawn  # no_worker 픽스처가 _spawn 을 막기 전의 원래 함수
+
+
+def test_spawn_wait_handles_old_worker_answering_late(no_worker, monkeypatch):
+    """새 워커를 띄우고 기다리는데 옛 워커가 답하면(앞의 ping 을 놓친 경우) 180초를 기다리지 않는다:
+    옛 워커를 내렸으면 한 번 더 띄우고, 내릴 수 없으면 바로 안내한다."""
+    monkeypatch.setattr(ghidra_client.config, "GHIDRA_INSTALL_DIR", _fake_ghidra(no_worker))
+    launches, retired = [], []
+    monkeypatch.setattr(ghidra_client, "_launch", lambda: launches.append(1))
+    pongs = iter([{"pid": 1, "protocol": 0}, None, {"pid": 2, "protocol": config.WORKER_PROTOCOL}])
+    monkeypatch.setattr(ghidra_client, "_ping", lambda: next(pongs))
+    monkeypatch.setattr(ghidra_client, "_retire_old_worker", lambda pong: retired.append(pong["pid"]))
+    _REAL_SPAWN()
+    assert launches == [1, 1] and retired == [1]
+
+    pongs2 = iter([{"pid": 1, "protocol": 0}])
+    monkeypatch.setattr(ghidra_client, "_ping", lambda: next(pongs2))
+
+    def refuse(pong):
+        raise store.LoupeError("옛 버전 Ghidra 워커(pid 1)가 떠 있다 ... kill <pid>")
+
+    monkeypatch.setattr(ghidra_client, "_retire_old_worker", refuse)
+    with pytest.raises(store.LoupeError, match="kill <pid>"):
+        _REAL_SPAWN()
+
+
+def _fake_ghidra(sock_path):
+    import os
+
+    d = os.path.join(os.path.dirname(sock_path), "ghidra")
+    os.makedirs(os.path.join(d, "support"), exist_ok=True)
+    open(os.path.join(d, "support", "analyzeHeadless"), "w").close()
+    from pathlib import Path
+
+    return Path(d)

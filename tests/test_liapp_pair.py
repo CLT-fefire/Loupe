@@ -172,3 +172,16 @@ def test_secret_scan_and_pair_report(pair):
     assert "eyJh…" in r["markdown"]
     jwt = next(v for f in analysis.secrets(b, reveal=True)["findings"] if f["rule"] == "jwt" for v in f["values"])
     assert jwt["value"] not in r["markdown"] and jwt["value"] not in str(r)
+
+
+def test_source_secrets_finds_known_hardcoded_values(pair):
+    """2026-11-10 수동 비교에서 찾은 하드코딩 3건이 모두 ipa 에 있는 것으로 나온다(8자 값은 Swift 인라인)."""
+    root = Path("/Users/Shared/Source/Company/Lysn_Epic/dontalk")
+    if not root.is_dir():
+        pytest.skip("Lysn 소스가 없다")
+    a, _ = pair
+    r = analysis.source_secrets(a, str(root))
+    names = {s["name"] for e in r["found"] for s in e["sources"]}
+    assert {"AES256DecryptWithKey", "TRANSLATE_FLITO_API_KEY", "certPassword"} <= names
+    inline = [e for e in r["found"] if any(w["how"] == "swift_inline" for w in e["in_ipa"])]
+    assert inline and inline[0]["length"] == 8

@@ -9,6 +9,7 @@ stdout/stderr 는 띄운 쪽(ghidra_client)이 로그 파일로 돌린다.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -39,6 +40,7 @@ _inuse: dict[str, int] = {}  # key -> 지금 쓰고 있는 요청 수
 _last_used: dict[str, float] = {}
 _indexes: dict[str, "FuncIndex"] = {}  # key -> 함수 이름 색인(프로그램을 닫으면 함께 버린다)
 _sigs: dict[str, dict[str, str]] = {}  # key -> {시작 주소: 함수 서명}(프로그램을 닫으면 함께 버린다)
+_deeps: dict[str, dict[str, str]] = {}  # key -> {시작 주소: 호출 대상까지 넣은 서명}
 _last_activity = time.time()
 
 
@@ -107,6 +109,7 @@ def _close(key: str) -> None:
     _programs.pop(key, None)
     _indexes.pop(key, None)
     _sigs.pop(key, None)
+    _deeps.pop(key, None)
     _last_used.pop(key, None)
     if proj is not None:
         try:
@@ -161,6 +164,25 @@ class _use:
         return False
 
 
+PROFILES = config.GHIDRA_PROFILES
+
+
+def _apply_profile(program, profile: str) -> None:
+    """프로필에 나오는 분석기를 모두 명시적으로 켜거나 끈다. 예전에 fast 로 저장된 프로젝트를 full 로
+    다시 분석할 때 꺼 둔 설정이 남지 않게, full 에서도 끄는 목록에 든 분석기를 다시 켠다."""
+    off = set(PROFILES[profile])
+    names = {n for v in PROFILES.values() for n in v}
+    if not names:
+        return
+    opts = program.getOptions("Analyzers")
+    tx = program.startTransaction("loupe analysis profile")
+    try:
+        for name in sorted(names):
+            opts.setBoolean(name, name not in off)
+    finally:
+        program.endTransaction(tx, True)
+
+
 def _analyze(key: str) -> None:
     import pyghidra
     from java.io import File
@@ -184,13 +206,21 @@ def _analyze(key: str) -> None:
             proj.saveAs(program, "/", name, True)
         else:
             program = proj.openProgram("/", name, False)
+        _apply_profile(program, job.get("profile", "full"))
         job["phase"] = "auto-analysis"
         pyghidra.analyze(program)
         proj.save(program)
         finished = time.time()
         marker(ipa_id, rel).write_text(
             json.dumps(
-                {"program": name, "rel": rel, "finished": finished, "seconds": round(finished - job["started"]), "size": path.stat().st_size}
+                {
+                    "program": name,
+                    "rel": rel,
+                    "profile": job.get("profile", "full"),
+                    "finished": finished,
+                    "seconds": round(finished - job["started"]),
+                    "size": path.stat().st_size,
+                }
             )
         )
         with _lock:
@@ -516,18 +546,7 @@ def _xrefs(prog, get_index, target: str, kind: str, limit: int) -> dict:
 
 
 def _function_bytes(prog, f) -> bytes:
-    from jpype import JArray, JByte
-
-    mem = prog.getMemory()
-    out = bytearray()
-    for rng in f.getBody():
-        buf = JArray(JByte)(int(rng.getLength()))
-        mem.getBytes(rng.getMinAddress(), buf)
-        try:
-            out += memoryview(buf).tobytes()  # 원시 배열을 한 번에 복사
-        except TypeError:
-            out += bytes(b & 0xFF for b in buf)
-    return bytes(out)
+    return b"".join(data for _, data in _function_ranges(prog, f))
 
 
 def _sig_fn(key: str, prog):
@@ -546,11 +565,69 @@ def _sig_fn(key: str, prog):
     return sig
 
 
+_STUB_BLOCKS = ("__stubs", "__auth_stubs")
+
+
+def _function_ranges(prog, f) -> list[tuple[int, bytes]]:
+    """함수 본문의 (시작 주소, 바이트) 범위들. 본문이 여러 조각이어도 조각마다 주소를 맞춘다."""
+    from jpype import JArray, JByte
+
+    mem = prog.getMemory()
+    out = []
+    for rng in f.getBody():
+        buf = JArray(JByte)(int(rng.getLength()))
+        mem.getBytes(rng.getMinAddress(), buf)
+        try:
+            data = memoryview(buf).tobytes()
+        except TypeError:
+            data = bytes(b & 0xFF for b in buf)
+        out.append((int(rng.getMinAddress().getOffset()), data))
+    return out
+
+
+def _deep_fn(key: str, prog, sig):
+    """시작 주소 -> '서명|호출 대상 요약'. 호출 대상이 import stub 이면 그 심볼 이름을, 그 밖에는 대상의
+    서명을 쓴다(ObjC 셀렉터 stub 은 이름이 난독화될 수 있어 서명). 요약은 해시 16자로 줄여 캐시한다.
+    한 단계만 따라간다 — 2026-11-10 실측에서 두 단계로 늘려도 thunk 쌍둥이를 더 구분하지 못했다
+    (참조하는 데이터 주소만 다른 구현은 재배치 마스크 때문에 서명이 같다)."""
+    with _lock:
+        cache = _deeps.setdefault(key, {})
+    fm = prog.getFunctionManager()
+    mem = prog.getMemory()
+    space = prog.getAddressFactory().getDefaultAddressSpace()
+
+    def callee(target: int) -> str:
+        f = fm.getFunctionContaining(space.getAddress(target))
+        if f is None:
+            return "?"
+        block = mem.getBlock(f.getEntryPoint())
+        if block is not None and str(block.getName()) in _STUB_BLOCKS:
+            return "stub:" + str(f.getName())
+        return sig(str(f.getEntryPoint()))
+
+    def deep(entry: str) -> str:
+        v = cache.get(entry)
+        if v is None:
+            f = _function_at(prog, entry)
+            if f is None:
+                v = ""
+            else:
+                targets = [t for base, code in _function_ranges(prog, f) for t in arm64.call_targets(code, base)]
+                summary = ",".join(callee(t) for t in targets)
+                v = sig(entry) + "|" + hashlib.sha1(summary.encode(), usedforsecurity=False).hexdigest()[:16]
+            cache[entry] = v
+        return v
+
+    return deep
+
+
 def op_function_signature(key: str, target: str) -> dict:
+    """함수의 서명과 호출 대상까지 넣은 서명(짝짓기 진단용)."""
     with _use(key) as prog:
         f = _find_function(prog, target, lambda: _index(key, prog))
         info = _func_info(f)
-        return {"function": info, "signature": _sig_fn(key, prog)(info["entry"])}
+        sig = _sig_fn(key, prog)
+        return {"function": info, "signature": sig(info["entry"]), "deep": _deep_fn(key, prog, sig)(info["entry"])}
 
 
 def op_match_pair(key: str, other_key: str, target: str) -> dict:
@@ -558,8 +635,9 @@ def op_match_pair(key: str, other_key: str, target: str) -> dict:
     with _use(key) as pa, _use(other_key) as pb:
         fa = _find_function(pa, target, lambda: _index(key, pa))
         info = _func_info(fa)
-        a = matching.Side(_index(key, pa), _sig_fn(key, pa))
-        b = matching.Side(_index(other_key, pb), _sig_fn(other_key, pb))
+        sa, sb = _sig_fn(key, pa), _sig_fn(other_key, pb)
+        a = matching.Side(_index(key, pa), sa, _deep_fn(key, pa, sa))
+        b = matching.Side(_index(other_key, pb), sb, _deep_fn(other_key, pb, sb))
         r = matching.choose(a, b, info["entry"], info["name"], info["size"], _function_at(pb, info["entry"]) is not None)
         r["a"] = info
         r["function"] = _func_info(_function_at(pb, r["entry"])) if r["entry"] else None
@@ -569,8 +647,10 @@ def op_match_pair(key: str, other_key: str, target: str) -> dict:
 # ── 서버 ───────────────────────────────────────────────────────────────
 
 
-def op_analyze(key: str, path: str) -> dict:
+def op_analyze(key: str, path: str, profile: str = "full") -> dict:
     ipa_id, rel = key.split("/", 1)
+    if profile not in PROFILES:
+        raise ValueError(f"profile 은 {list(PROFILES)} 중 하나다")
     # 소켓은 같은 계정만 붙지만, 워커가 여는 파일은 key 가 가리키는 바이너리 하나로만 제한한다.
     # 앱 위치는 store(meta.json)가 정한다 — 받은 path 는 그 파일과 같을 때만 받아들인다
     try:
@@ -582,11 +662,21 @@ def op_analyze(key: str, path: str) -> dict:
     path = str(expected)
     with _lock:
         if marker(ipa_id, rel).exists():
-            return {"state": "done", "cached": True}
+            done = {"state": "done", "cached": True}
+            try:
+                done["profile"] = json.loads(marker(ipa_id, rel).read_text()).get("profile", "full")
+            except (OSError, ValueError):
+                done["profile"] = "full"
+            if done["profile"] != profile:
+                done["note"] = (
+                    f"이미 {done['profile']} 로 분석돼 있어 그 결과를 쓴다. {profile} 로 다시 분석하려면 "
+                    "ipa_clear(id) 로 지운 뒤 다시 연다"
+                )
+            return done
         job = _jobs.get(key)
         if job and job["state"] in ("queued", "running"):
             return _status_one(key)
-        _jobs[key] = {"state": "queued", "path": path, "queued": time.time()}
+        _jobs[key] = {"state": "queued", "path": path, "queued": time.time(), "profile": profile}
         _pending.append(key)
         _main_q.put(lambda k=key: _analyze(k))
     return _status_one(key)
@@ -595,18 +685,23 @@ def op_analyze(key: str, path: str) -> dict:
 DEFAULT_SEC_PER_MB = 23.0  # 2026-11-09 실측: 26.5MB 메인 바이너리 608~629초
 
 
-def _sec_per_mb() -> float:
-    """지난 분석 기록(analyzed.json)으로 MB 당 분석 시간을 추정한다."""
+DEFAULT_SEC_PER_MB_FAST = 16.5  # 2026-11-10 실측: 26.5MB 438초
+
+
+def _sec_per_mb(profile: str = "full") -> float:
+    """지난 분석 기록(analyzed.json)으로 MB 당 분석 시간을 추정한다(같은 프로필끼리)."""
     rates = []
     for m in config.CACHE_DIR.glob("*/ghidra/*/analyzed.json"):
         try:
             d = json.loads(m.read_text())
+            if d.get("profile", "full") != profile:
+                continue
             if d.get("seconds") and d.get("size", 0) > 1_000_000:  # 작은 파일은 고정비가 커서 뺀다
                 rates.append(d["seconds"] / (d["size"] / 1e6))
         except Exception:
             continue
     if not rates:
-        return DEFAULT_SEC_PER_MB
+        return DEFAULT_SEC_PER_MB_FAST if profile == "fast" else DEFAULT_SEC_PER_MB
     rates.sort()
     return rates[len(rates) // 2]
 
@@ -618,7 +713,7 @@ def _status_one(key: str) -> dict:
         return {"key": key, "state": "done" if marker(ipa_id, rel).exists() else "not_started", "worker": "running"}
     # 메인 스레드가 job 을 바꾸는 중일 수 있으므로 값은 한 번씩만 읽는다
     state, started, finished = job["state"], job.get("started"), job.get("finished")
-    out = {"key": key, "state": state, "worker": "running"}
+    out = {"key": key, "state": state, "worker": "running", "profile": job.get("profile", "full")}
     elapsed = round((finished or time.time()) - started) if started else None
     if elapsed is not None:
         out["elapsed_s"] = elapsed
@@ -629,7 +724,7 @@ def _status_one(key: str) -> dict:
     if state in ("queued", "running"):
         try:
             mb = Path(job["path"]).stat().st_size / 1e6
-            est = round(mb * _sec_per_mb())
+            est = round(mb * _sec_per_mb(job.get("profile", "full")))
             out["estimated_total_s"] = est
             if elapsed is not None:
                 out["estimated_remaining_s"] = max(0, est - elapsed)
@@ -670,6 +765,22 @@ def op_forget(ipa_id: str) -> dict:
     return {"closed": closed}
 
 
+_server_ref: list = []  # main() 이 띄운 소켓 서버(shutdown 이 쓴다)
+
+
+def op_shutdown() -> dict:
+    """새 버전 MCP 서버가 옛 워커를 내릴 때 부른다. 분석이나 다른 요청이 진행 중이면 거부한다."""
+    with _lock:
+        busy = _inflight > 1 or any(j["state"] in ("queued", "running") for j in _jobs.values())
+    if busy:
+        raise RuntimeError("분석이나 조회가 진행 중이라 내리지 않는다")
+    _log("새 버전 요청으로 종료")
+    _stop.set()
+    if _server_ref:
+        threading.Thread(target=_server_ref[0].shutdown, daemon=True).start()
+    return {"stopping": True, "pid": os.getpid()}
+
+
 _KEY = re.compile(r"[0-9a-f]{6,64}/[^\x00]+")
 _IPA_ID = re.compile(r"[0-9a-f]{6,64}")
 
@@ -692,7 +803,8 @@ def check_args(req: dict) -> None:
 
 OPS = {
     "forget": op_forget,
-    "ping": lambda: {"ok": True, "pid": os.getpid()},
+    "ping": lambda: {"ok": True, "pid": os.getpid(), "protocol": config.WORKER_PROTOCOL},
+    "shutdown": lambda: op_shutdown(),
     "analyze": op_analyze,
     "status": op_status,
     "search_functions": op_search_functions,
@@ -821,6 +933,7 @@ def main() -> None:
     server = Server(sock, Handler)
     os.umask(old)
     my_inode = os.stat(sock).st_ino
+    _server_ref.append(server)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=_idle_watch, args=(server,), daemon=True).start()
     _log(f"소켓 대기 {sock}")

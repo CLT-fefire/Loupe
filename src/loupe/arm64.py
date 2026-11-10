@@ -56,3 +56,19 @@ def mask_relocations(code: bytes) -> bytes:
 
 def signature(code: bytes) -> str:
     return hashlib.sha1(mask_relocations(code), usedforsecurity=False).hexdigest()[:16]
+
+
+def call_targets(code: bytes, base: int) -> list[int]:
+    """BL 과, 함수 밖으로 나가는 B(꼬리 호출)의 대상 주소(코드 순서)."""
+    n = len(code) // 4
+    out = []
+    for k, w in enumerate(struct.unpack(f"<{n}I", code[: 4 * n])):
+        if w & 0x7C000000 != 0x14000000:  # B / BL
+            continue
+        imm = w & 0x03FFFFFF
+        if imm & 0x02000000:
+            imm -= 1 << 26
+        target = base + 4 * k + 4 * imm
+        if w & 0x80000000 or not base <= target < base + len(code):
+            out.append(target)
+    return out

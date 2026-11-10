@@ -10,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from . import config, macho, names, secret_scan, signing, swift_small
+from . import config, literals, macho, names, secret_scan, signing, swift_small
 from .store import Ipa, LoupeError
 
 SWIFT_INLINE_LIMIT = 15  # Swift 는 이 바이트 이하 문자열을 명령어에 인라인한다
@@ -306,14 +306,6 @@ def diff(a: Ipa, b: Ipa, samples: int = 10) -> dict:
 _LITERAL = re.compile(r'@?"((?:[^"\\\n]|\\.)*)"')
 _CHAR_LITERAL = re.compile(r"'(?:\\.|[^'\\\n])'")  # ObjC/C 문자 리터럴 '"' 같은 것
 _INTERP = re.compile(r"\\\((?:[^()]|\([^()]*\))*\)")  # Swift 문자열 보간 \(...)
-_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "'": "'", "\\": "\\", "0": "\0"}
-
-
-def _unescape(lit: str) -> str:
-    lit = re.sub(r"\\u\{([0-9a-fA-F]{1,8})\}", lambda m: chr(int(m.group(1), 16)), lit)  # Swift \u{AC00}
-    return re.sub(r"\\(.)", lambda m: _ESCAPES.get(m.group(1), m.group(0)), lit)
-
-
 def literals_from_source(ref: str) -> tuple[list[str], list[str]]:
     """'경로:줄' 에서 문자열 리터럴을 꺼낸다. (리터럴 목록, 경고 목록)을 돌려준다.
 
@@ -345,7 +337,7 @@ def literals_from_source(ref: str) -> tuple[list[str], list[str]]:
         else:
             pieces = [lit]
         for p in pieces:
-            u = _unescape(p)
+            u = literals.unescape(p)
             if u and u not in out:
                 out.append(u)
     if not out:
@@ -621,6 +613,30 @@ def secrets(ipa: Ipa, scope: str = "all", reveal: bool = False) -> dict:
     ]
     if not reveal:
         r["notes"].append("값은 앞 4자·뒤 2자만 보여 준다. 같은 값인지는 fingerprint 로 비교한다. 원문은 reveal=true.")
+    return r
+
+
+def source_secrets(ipa: Ipa, root: str, reveal: bool = False, include_absent: bool = False) -> dict:
+    """소스에서 비밀값 모양의 리터럴을 찾아, ipa 에 실제로 들어갔는지 확인한다."""
+    path = Path(root).expanduser()
+    if not path.is_absolute():
+        cands = [r / path for r in config.SOURCE_ROOTS if (r / path).is_dir()]
+        if not cands:
+            raise LoupeError(f"소스 폴더를 찾지 못했다: {root} (루트: {[str(r) for r in config.SOURCE_ROOTS]})")
+        path = cands[0]
+    if not path.is_dir():
+        raise LoupeError(f"소스 폴더가 아니다: {path}")
+    if not config.is_under(path, config.SOURCE_ROOTS):
+        raise LoupeError(f"허용된 소스 루트 밖이다: {path} (LOUPE_SOURCE_ROOTS 로 바꿀 수 있다)")
+    r = secret_scan.source_scan(ipa, path.resolve(), reveal, include_absent)
+    r["notes"] = [
+        "비밀 키워드(key·secret·password·token·salt·credential·auth)가 붙은 이름 바로 뒤의 리터럴만 본다. "
+        "다른 이름에 담기거나 여러 조각으로 이어 붙인 값은 찾지 못한다.",
+        "in_ipa 는 바이트·UTF-16·Swift 인라인(15바이트 이하)으로 ipa 안에서 찾은 곳이다. "
+        "보호 적용본이라도 여기 나오면 그 값은 꺼낼 수 있다.",
+    ]
+    if not reveal:
+        r["notes"].append("값은 가린다. 원문은 reveal=true.")
     return r
 
 
