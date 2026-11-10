@@ -270,3 +270,169 @@ def test_events_where_and_window_bisect():
     m = fake_macho(text_of(*insns))
     assert len(swift_small.find(m, "hi")) == 1
     assert len(swift_small._events(m).where(w0)) == 2
+
+
+# ── 함수 서명(compare_function 짝짓기) ──────────────────────────────────
+
+from loupe import arm64  # noqa: E402
+
+
+def bl(off):
+    return 0x94000000 | (off & 0x03FFFFFF)
+
+
+def adrp(rd, imm):
+    return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | rd
+
+
+def add_imm(rd, rn, imm12):
+    return 0x91000000 | (imm12 << 10) | (rn << 5) | rd
+
+
+def test_signature_ignores_relocated_offsets():
+    a = text_of(adrp(0, 0x123), add_imm(0, 0, 0x45), bl(0x1000), movz(1, 7), 0xD65F03C0)
+    b = text_of(adrp(0, 0x999), add_imm(0, 0, 0x10), bl(0x2340), movz(1, 7), 0xD65F03C0)
+    assert arm64.signature(a) == arm64.signature(b)
+
+
+def test_signature_keeps_add_imm_not_paired_with_adrp():
+    """스택 크기·필드 오프셋(ADRP 짝이 아닌 ADD 즉값)은 로직이라 지우지 않는다."""
+    sp = 31
+    a = text_of(add_imm(sp, sp, 0x20), bl(0x10))
+    b = text_of(add_imm(sp, sp, 0x30), bl(0x10))
+    assert arm64.signature(a) != arm64.signature(b)
+    # ADRP 와 다른 레지스터를 밑으로 쓰는 ADD 도 그대로 둔다
+    c = text_of(adrp(0, 0x1), add_imm(1, 2, 0x8))
+    d = text_of(adrp(0, 0x1), add_imm(1, 2, 0x9))
+    assert arm64.signature(c) != arm64.signature(d)
+
+
+def test_signature_keeps_real_differences():
+    a = text_of(bl(0x1000), movz(1, 7))
+    assert arm64.signature(a) != arm64.signature(text_of(bl(0x1000), movz(1, 8)))  # 즉값 상수는 로직이다
+    assert arm64.signature(a) != arm64.signature(text_of(bl(0x1000), movz(2, 7)))  # 레지스터
+    assert arm64.signature(a) != arm64.signature(text_of(bl(0x1000)))  # 길이
+
+
+# ── 짝짓기 규칙(matching.choose) ────────────────────────────────────────
+
+from loupe import matching  # noqa: E402
+from loupe.ghidra_worker import FuncEntry, FuncIndex  # noqa: E402
+
+
+def side(rows, sigs):
+    """rows: (전체 이름, 시작 주소, 크기), sigs: {주소: 서명}"""
+    idx = FuncIndex([FuncEntry(n, matching.short_name(n), e, True, sz) for n, e, sz in rows])
+    calls = []
+
+    def sig(entry):
+        calls.append(entry)
+        return sigs.get(entry, "")
+
+    s = matching.Side(idx, sig)
+    s.calls = calls
+    return s
+
+
+def test_choose_same_address_and_signature():
+    a = side([("A::f", "1000", 8)], {"1000": "s"})
+    b = side([("zZZ::f", "1000", 8)], {"1000": "s"})
+    r = matching.choose(a, b, "1000", "A::f", 8, True)
+    assert r == {"method": "address", "entry": "1000", "notes": []}
+
+
+def test_choose_name_when_address_moved():
+    a = side([("A::f", "1000", 8)], {"1000": "s"})
+    b = side([("A::f", "2000", 8), ("A::g", "1000", 8)], {"2000": "s", "1000": "t"})
+    r = matching.choose(a, b, "1000", "A::f", 8, True)
+    assert (r["method"], r["entry"], r["notes"]) == ("name", "2000", [])
+
+
+def test_choose_name_requires_uniqueness_in_a_too():
+    """a 에 같은 이름이 둘이면 b 의 유일한 같은 이름이 진짜 짝이라는 보장이 없다."""
+    a = side([("A::f", "1000", 8), ("A::f", "1100", 8)], {"1000": "s1", "1100": "s2"})
+    b = side([("A::f", "2000", 8), ("X::y", "3000", 8)], {"2000": "s1", "3000": "s2"})
+    r = matching.choose(a, b, "1100", "A::f", 8, False)
+    assert (r["method"], r["entry"]) == ("signature", "3000")
+
+
+def test_choose_method_name_when_class_obfuscated():
+    a = side([("Foo::billingError:", "1000", 8)], {"1000": "s"})
+    b = side([("zZZaaa::billingError:", "2000", 8)], {"2000": "s"})
+    r = matching.choose(a, b, "1000", "Foo::billingError:", 8, False)
+    assert (r["method"], r["entry"]) == ("method_name", "2000")
+
+
+def test_choose_skips_generated_names():
+    """순번·주소로 붙는 이름은 빌드마다 다른 함수를 가리킬 수 있어 이름으로 짝짓지 않는다."""
+    a = side([("_OUTLINED_FUNCTION_57", "1000", 8)], {"1000": "s"})
+    b = side([("_OUTLINED_FUNCTION_57", "2000", 8), ("_OUTLINED_FUNCTION_58", "2100", 8)], {"2000": "other", "2100": "s"})
+    r = matching.choose(a, b, "1000", "_OUTLINED_FUNCTION_57", 8, False)
+    assert (r["method"], r["entry"]) == ("signature", "2100")
+    assert matching.is_generated("thunk_FUN_100004000") and not matching.is_generated("Foo::bar")
+
+
+def test_choose_signature_rank_within_group():
+    names = ["zZ::a", "zZ::b", "zZ::c"]
+    a = side([(f"A::{n[-1]}", e, 8) for n, e in zip(names, ["1000", "1010", "1020"])], {"1000": "s", "1010": "s", "1020": "s"})
+    b = side([(n, e, 8) for n, e in zip(names, ["2000", "2010", "2020"])], {"2000": "s", "2010": "s", "2020": "s"})
+    r = matching.choose(a, b, "1010", "NoSuch::x", 8, False)
+    assert (r["method"], r["entry"]) == ("signature", "2010")
+    assert "2번째" in r["notes"][0]
+
+
+def test_choose_rejects_unique_b_hit_when_a_group_is_larger():
+    """b 에서 하나뿐이어도 a 묶음이 둘이면 어느 쪽의 짝인지 모른다(리뷰 지적 2026-11-10)."""
+    a = side([("FUN_1000", "1000", 8), ("FUN_1010", "1010", 8)], {"1000": "s", "1010": "s"})
+    b = side([("FUN_2000", "2000", 8)], {"2000": "s"})
+    r = matching.choose(a, b, "1010", "FUN_1010", 8, False)
+    assert r["method"] is None and "a 2개, b 1개" in r["notes"][0]
+
+
+def test_choose_falls_back_to_same_address_with_note():
+    a = side([("FUN_1000", "1000", 8)], {"1000": "s"})
+    b = side([("FUN_1000", "1000", 8)], {"1000": "changed"})
+    r = matching.choose(a, b, "1000", "FUN_1000", 8, True)
+    assert r["method"] == "address" and "코드 서명이 다르다" in r["notes"][-1]
+
+
+def test_choose_does_not_hash_candidates_when_name_matches():
+    """이름으로 정해지면 크기가 같은 후보 전체의 서명을 계산하지 않는다."""
+    rows = [("A::f", "1000", 8)] + [(f"A::g{i}", f"{0x3000 + i:x}", 8) for i in range(50)]
+    a = side(rows, {"1000": "s"})
+    b = side([("A::f", "2000", 8)] + rows[1:], {"2000": "s"})
+    matching.choose(a, b, "1000", "A::f", 8, False)
+    assert len(a.calls) <= 1 and len(b.calls) <= 1
+
+
+def test_choose_shifted_layout_does_not_trust_same_address_sibling():
+    """서명이 같은 thunk 묶음에서 b 배치가 한 칸 밀리면, 같은 주소에는 형제 함수가 온다(재리뷰 지적 2026-11-10)."""
+    ea = ["1000", "1080", "1100", "1180"]
+    eb = ["1080", "1100", "1180", "1200"]  # 한 칸 밀림
+    a = side([(f"FUN_{e}", e, 8) for e in ea], {e: "s" for e in ea})
+    b = side([(f"FUN_{e}", e, 8) for e in eb], {e: "s" for e in eb})
+    r = matching.choose(a, b, "1080", "FUN_1080", 8, True)  # a 의 두 번째 함수
+    assert (r["method"], r["entry"]) == ("signature", "1100")
+    assert any("배치가 밀린" in n for n in r["notes"])
+
+
+def test_choose_names_win_over_same_address_sibling():
+    a = side([("A::x", "1000", 8), ("A::y", "1080", 8)], {"1000": "s", "1080": "s"})
+    b = side([("A::x", "1080", 8), ("A::y", "1100", 8)], {"1080": "s", "1100": "s"})
+    r = matching.choose(a, b, "1080", "A::y", 8, True)
+    assert (r["method"], r["entry"]) == ("name", "1100")
+
+
+def test_choose_same_address_with_ambiguous_group_is_flagged():
+    a = side([("FUN_1000", "1000", 8), ("FUN_1080", "1080", 8)], {"1000": "s", "1080": "s"})
+    b = side([("FUN_1000", "1000", 8)], {"1000": "s"})
+    r = matching.choose(a, b, "1000", "FUN_1000", 8, True)
+    assert r["method"] == "address" and "다른 함수일 수 있다" in r["notes"][-1]
+
+
+def test_choose_non_code_function_does_not_crash():
+    idx_rows = [FuncEntry("FUN_1000", "FUN_1000", "1000", False, 8)]
+    a = matching.Side(FuncIndex(idx_rows), lambda e: "s")
+    b = side([("FUN_2000", "2000", 8)], {"2000": "s"})
+    r = matching.choose(a, b, "1000", "FUN_1000", 8, False)
+    assert r["method"] is None and "코드 블록 밖" in r["notes"][0]

@@ -70,3 +70,36 @@ def test_parallel_queries_do_not_fail():
     assert all(n >= 1 for n in res)
     st = ghidra_client.call("status")
     assert len(st["open_programs"]) <= st["max_open"]
+
+
+FN = "_TtC10Fork_Stars15IAPPopupManager::billingErrorOnDismiss:"
+
+
+def _sig(ipa_id, target):
+    return ghidra_client.call("function_signature", key=f"{ipa_id}/Fork_Stars", target=target)
+
+
+def test_compare_function_reports_how_it_matched():
+    r = server.compare_function(a=PLAIN, b=LIAPP, function=FN, max_chars=200)
+    assert r["matched_by"] == "address" and not r["notes"]
+
+
+def test_same_function_has_same_signature_in_both_builds():
+    """적용본은 클래스 이름이 바뀌었지만(zZZ…) 코드 서명은 같다."""
+    a, b = _sig(PLAIN, "0x1007148f0"), _sig(LIAPP, "0x1007148f0")
+    assert a["signature"] == b["signature"]
+    assert a["function"]["name"] != b["function"]["name"]
+
+
+def test_signature_group_of_selector_thunks():
+    """분기 대상만 다른 셀렉터 thunk 는 서명이 같은 묶음이 된다(2026-11-10: 4개)."""
+    from loupe import matching
+
+    sigs = [_sig(PLAIN, f"0x{e}")["signature"] for e in ("1007148f0", "100714970", "1007149f0", "100714a70")]
+    assert len(set(sigs)) == 1
+    assert matching.short_name(FN) == "billingErrorOnDismiss:"
+
+
+def test_worker_rejects_bad_key():
+    with pytest.raises(Exception, match="잘못된 key"):
+        ghidra_client.call("search_functions", key=f"{PLAIN}/../x", pattern=".")

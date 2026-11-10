@@ -21,7 +21,7 @@ import traceback
 from pathlib import Path
 from typing import NamedTuple
 
-from . import config
+from . import arm64, config, matching, store
 
 IDLE_SECONDS = int(os.environ.get("LOUPE_GHIDRA_IDLE", "1800"))
 XMX = os.environ.get("LOUPE_GHIDRA_XMX", "8g")
@@ -38,6 +38,7 @@ _key_locks: dict[str, threading.Lock] = {}  # 바이너리별 열기 잠금(큰 
 _inuse: dict[str, int] = {}  # key -> 지금 쓰고 있는 요청 수
 _last_used: dict[str, float] = {}
 _indexes: dict[str, "FuncIndex"] = {}  # key -> 함수 이름 색인(프로그램을 닫으면 함께 버린다)
+_sigs: dict[str, dict[str, str]] = {}  # key -> {시작 주소: 함수 서명}(프로그램을 닫으면 함께 버린다)
 _last_activity = time.time()
 
 
@@ -105,6 +106,7 @@ def _close(key: str) -> None:
     proj = _projects.pop(key, None)
     _programs.pop(key, None)
     _indexes.pop(key, None)
+    _sigs.pop(key, None)
     _last_used.pop(key, None)
     if proj is not None:
         try:
@@ -239,6 +241,7 @@ class FuncEntry(NamedTuple):
     short: str  # 네임스페이스 없는 이름
     entry: str  # 시작 주소 문자열 (str(Address))
     is_code: bool  # 실행 가능한 메모리 블록에 있는가
+    size: int = 0  # 바이트 수(본문 주소 수)
 
 
 class FuncIndex:
@@ -281,7 +284,15 @@ def _build_index(prog) -> FuncIndex:
     for f in prog.getFunctionManager().getFunctions(True):
         entry = f.getEntryPoint()
         block = mem.getBlock(entry)
-        rows.append(FuncEntry(str(f.getName(True)), str(f.getName()), str(entry), block is not None and block.isExecute()))
+        rows.append(
+            FuncEntry(
+                str(f.getName(True)),
+                str(f.getName()),
+                str(entry),
+                block is not None and block.isExecute(),
+                int(f.getBody().getNumAddresses()),
+            )
+        )
     return FuncIndex(rows)
 
 
@@ -501,11 +512,74 @@ def _xrefs(prog, get_index, target: str, kind: str, limit: int) -> dict:
     return {"target": target, "matches": results}
 
 
+# ── 함수 짝짓기(compare_function) ────────────────────────────────────────
+
+
+def _function_bytes(prog, f) -> bytes:
+    from jpype import JArray, JByte
+
+    mem = prog.getMemory()
+    out = bytearray()
+    for rng in f.getBody():
+        buf = JArray(JByte)(int(rng.getLength()))
+        mem.getBytes(rng.getMinAddress(), buf)
+        try:
+            out += memoryview(buf).tobytes()  # 원시 배열을 한 번에 복사
+        except TypeError:
+            out += bytes(b & 0xFF for b in buf)
+    return bytes(out)
+
+
+def _sig_fn(key: str, prog):
+    """시작 주소 -> 서명. 프로그램마다 캐시한다(프로그램을 닫으면 함께 버린다)."""
+    with _lock:
+        cache = _sigs.setdefault(key, {})
+
+    def sig(entry: str) -> str:
+        v = cache.get(entry)
+        if v is None:
+            f = _function_at(prog, entry)
+            v = arm64.signature(_function_bytes(prog, f)) if f is not None else ""
+            cache[entry] = v
+        return v
+
+    return sig
+
+
+def op_function_signature(key: str, target: str) -> dict:
+    with _use(key) as prog:
+        f = _find_function(prog, target, lambda: _index(key, prog))
+        info = _func_info(f)
+        return {"function": info, "signature": _sig_fn(key, prog)(info["entry"])}
+
+
+def op_match_pair(key: str, other_key: str, target: str) -> dict:
+    """a(key)의 함수 target 에 대응하는 b(other_key)의 함수. 규칙은 matching.choose."""
+    with _use(key) as pa, _use(other_key) as pb:
+        fa = _find_function(pa, target, lambda: _index(key, pa))
+        info = _func_info(fa)
+        a = matching.Side(_index(key, pa), _sig_fn(key, pa))
+        b = matching.Side(_index(other_key, pb), _sig_fn(other_key, pb))
+        r = matching.choose(a, b, info["entry"], info["name"], info["size"], _function_at(pb, info["entry"]) is not None)
+        r["a"] = info
+        r["function"] = _func_info(_function_at(pb, r["entry"])) if r["entry"] else None
+        return r
+
+
 # ── 서버 ───────────────────────────────────────────────────────────────
 
 
 def op_analyze(key: str, path: str) -> dict:
     ipa_id, rel = key.split("/", 1)
+    # 소켓은 같은 계정만 붙지만, 워커가 여는 파일은 key 가 가리키는 바이너리 하나로만 제한한다.
+    # 앱 위치는 store(meta.json)가 정한다 — 받은 path 는 그 파일과 같을 때만 받아들인다
+    try:
+        expected = (store.get(ipa_id).app / rel).resolve()
+    except store.LoupeError as e:
+        raise ValueError(str(e)) from e
+    if Path(path).resolve() != expected or not expected.is_file():
+        raise ValueError("허용되지 않는 경로다(key 가 가리키는 바이너리만 분석한다)")
+    path = str(expected)
     with _lock:
         if marker(ipa_id, rel).exists():
             return {"state": "done", "cached": True}
@@ -596,6 +670,26 @@ def op_forget(ipa_id: str) -> dict:
     return {"closed": closed}
 
 
+_KEY = re.compile(r"[0-9a-f]{6,64}/[^\x00]+")
+_IPA_ID = re.compile(r"[0-9a-f]{6,64}")
+
+
+def check_args(req: dict) -> None:
+    """요청 인자 검사. key 는 '<ipa id>/<앱 기준 상대 경로>', 경로에 .. 나 빈 조각이 없어야 한다."""
+    for name in ("key", "other_key"):
+        key = req.get(name)
+        if key is None:
+            continue
+        if not isinstance(key, str) or not _KEY.fullmatch(key):
+            raise ValueError(f"잘못된 {name}")
+        rel = key.split("/", 1)[1]
+        if rel.startswith("/") or any(part in ("", ".", "..") for part in rel.split("/")):
+            raise ValueError(f"잘못된 {name}")
+    ipa_id = req.get("ipa_id")
+    if ipa_id is not None and (not isinstance(ipa_id, str) or not _IPA_ID.fullmatch(ipa_id)):
+        raise ValueError("잘못된 ipa_id")
+
+
 OPS = {
     "forget": op_forget,
     "ping": lambda: {"ok": True, "pid": os.getpid()},
@@ -604,6 +698,8 @@ OPS = {
     "search_functions": op_search_functions,
     "decompile": op_decompile,
     "xrefs": op_xrefs,
+    "function_signature": op_function_signature,
+    "match_pair": op_match_pair,
 }
 
 
@@ -625,6 +721,7 @@ class Handler(socketserver.StreamRequestHandler):
                 fn = OPS.get(op)
                 if fn is None:
                     raise ValueError(f"모르는 op: {op}")
+                check_args(req)
                 resp = {"ok": True, "result": fn(**req)}
             except Exception as e:
                 resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}

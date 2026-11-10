@@ -248,3 +248,53 @@ def test_ipa_list_maps_old_marker_folder_to_binary_path(sandbox):
     m.parent.mkdir(parents=True)
     m.write_text("{}")
     assert store.list_opened()["ipas"][0]["ghidra_analyzed"] == ["Frameworks/X.framework/X"]
+
+
+# ── 워커 인자 재검사 ─────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "req",
+    [
+        {"key": "abc123/../../etc/passwd"},
+        {"key": "abc123//x"},
+        {"key": "abc123/./A"},
+        {"key": "ABC/x"},  # id 는 소문자 16진수
+        {"key": "abc123"},  # 경로가 없다
+        {"key": 5},
+        {"ipa_id": "../x"},
+    ],
+)
+def test_check_args_rejects(req):
+    with pytest.raises(ValueError):
+        ghidra_worker.check_args(req)
+
+
+def test_check_args_accepts_normal_keys():
+    ghidra_worker.check_args({"key": "85790996ee7f/Fork_Stars"})
+    ghidra_worker.check_args({"key": "85790996ee7f/Frameworks/X.framework/X", "ipa_id": "85790996ee7f"})
+
+
+def test_analyze_rejects_path_outside_ipa_cache(sandbox, tmp_path_factory):
+    ipa = _ipa(sandbox)
+    outside = tmp_path_factory.mktemp("o") / "A"
+    outside.write_bytes(b"x")
+    with pytest.raises(ValueError, match="허용되지 않는 경로"):
+        ghidra_worker.op_analyze(f"{ipa.id}/A", str(outside))
+    # 캐시 안이어도 key 의 바이너리와 다른 파일이면 거부한다
+    with pytest.raises(ValueError, match="허용되지 않는 경로"):
+        ghidra_worker.op_analyze(f"{ipa.id}/A", str(ipa.app / "blob"))
+    # 이름이 같은 다른 위치(appex 안 같은 이름 프레임워크 등)도 거부한다 — 앱 위치는 meta.json 기준
+    other = ipa.root / "x" / "Payload" / "Other" / "A"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"x")
+    with pytest.raises(ValueError, match="허용되지 않는 경로"):
+        ghidra_worker.op_analyze(f"{ipa.id}/A", str(other))
+    with pytest.raises(ValueError, match="열린 ipa 가 아니다"):
+        ghidra_worker.op_analyze("abcdef123456/A", str(outside))
+    assert ghidra_worker._jobs.get(f"{ipa.id}/A") is None
+
+
+def test_check_args_checks_other_key():
+    with pytest.raises(ValueError, match="other_key"):
+        ghidra_worker.check_args({"key": "abc123/A", "other_key": "abc123/../A"})

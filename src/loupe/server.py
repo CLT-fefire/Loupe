@@ -271,26 +271,37 @@ def decompile(id: str, function: str, binary: str = "main", timeout: int = 60, m
 def compare_function(a: str, b: str, function: str, binary: str = "main", max_chars: int = 6000) -> dict[str, Any]:
     """같은 함수를 두 ipa 에서 디컴파일해 비교한다(미적용 a, 적용 b 쌍용).
 
-    function 은 a 에서의 이름이나 주소(0x…). b 에서는 같은 주소의 함수를 쓴다 — LIAPP 처럼 코드 배치를
-    바꾸지 않는 보호라면 주소가 같다. 결과: identical(완전히 같음), names_only(로직은 같고 이름만 바뀜),
-    renamed(바뀐 이름 짝), diff(그 밖의 차이).
+    function 은 a 에서의 이름이나 주소(0x…). b 에서 짝은 이 순서로 찾는다(matched_by):
+    name / method_name(전체 이름, 안 되면 :: 뒤 메서드 이름이 양쪽에서 하나뿐) → address(같은 주소·같은 서명.
+    서명이 같은 형제 함수가 여럿이면 묶음 순서까지 맞을 때만) → signature(재배치를 무시한 바이트 서명 묶음에서
+    a 와 같은 순서) → address(같은 주소, 코드는 다르거나 확정 못 함 — notes 에 이유).
+    결과: identical(완전히 같음), names_only(로직은 같고 이름만 바뀜), renamed(바뀐 이름 짝), diff(그 밖의 차이).
     """
     max_chars = analysis.clamp("max_chars", max_chars, 100, 100_000)
     ia, ib = store.get(a), store.get(b)
     ka, _ = _key(ia, binary)
     kb, _ = _key(ib, binary)
     ra = ghidra_client.call("decompile", wait=120, key=ka, target=function, timeout=60, max_chars=10**7)
-    entry = "0x" + ra["function"]["entry"]
-    rb = ghidra_client.call("decompile", wait=120, key=kb, target=entry, timeout=60, max_chars=10**7)
+    fa = ra["function"]
+    m = ghidra_client.call("match_pair", wait=300, key=ka, other_key=kb, target="0x" + fa["entry"])
+    if m["method"] is None:
+        raise LoupeError(
+            f"b 에서 {fa['name']}(0x{fa['entry']}) 의 짝을 찾지 못했다(주소·이름·서명 모두 실패). "
+            + " ".join(m["notes"])
+        )
+    rb = ghidra_client.call(
+        "decompile", wait=120, key=kb, target="0x" + m["function"]["entry"], timeout=60, max_chars=10**7
+    )
     cmp = analysis.compare_code(ra["code"], rb["code"])
-    notes = []
-    if rb["function"]["entry"] != ra["function"]["entry"]:
-        notes.append("b 에서 그 주소는 다른 함수의 중간이다. 코드 배치가 달라 주소로 짝지을 수 없다")
-    if rb["function"]["size"] != ra["function"]["size"]:
-        notes.append(f"함수 크기가 다르다: {ra['function']['size']} vs {rb['function']['size']} 바이트")
+    notes = list(m["notes"])
+    if m["function"]["entry"] != fa["entry"]:
+        notes.append(f"주소가 달라 {m['method']} 로 짝지었다: a 0x{fa['entry']} → b 0x{m['function']['entry']}")
+    if rb["function"]["size"] != fa["size"]:
+        notes.append(f"함수 크기가 다르다: {fa['size']} vs {rb['function']['size']} 바이트")
     return {
-        "a": ra["function"],
+        "a": fa,
         "b": rb["function"],
+        "matched_by": m["method"],
         **cmp,
         "notes": notes,
         "code_a": ra["code"][:max_chars],
